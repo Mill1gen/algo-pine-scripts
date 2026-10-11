@@ -1,0 +1,1306 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// SNIPER_BRAVO v2 — 1m scalp-precision execution layer (Quarterly Theory)
+// ───────────────────────────────────────────────────────────────────────────
+// v2 CHANGES (from v1):
+//   · STOP BAND: the tightened structural stop is now bounded by a per-asset
+//     MIN/MAX band (% of price), matching SNIPER_ALPHA v2:
+//       tightened distance < min → stop WIDENED to the min distance
+//       tightened distance > max → entry SKIPPED (grey SKIP marker)
+//     NOTE: a min-widen can place the stop BEYOND the measured structural
+//     level (further than the untightened distance) when the measured move
+//     is small — the stop is wider, never inside the tighten geometry.
+//   · STOP CONFIG IS PER-STRATEGY, PER-ASSET: tighten % + min/max band live
+//     inside each strategy's config (CbrConfig / F2Config) — no shared global
+//     tighten input, no shared band. CBR and F2 tune independently per asset,
+//     matching the suite plan's "Structural Stop Settings per setup" model.
+//   · ALERT FIX: payloads read the signal-bar locals (not the tracker), so a
+//     fire while the lock is off and a trade is open can no longer emit the
+//     PREVIOUS trade's entry/SL/TP.
+// Hosts two entry strategies — CBR · F2 — each long & short, sharing one
+// structure read, one bias engine, one trade tracker (single open position
+// across both), and per-strategy SupaCron alerts.
+//   CBR ENTRY MODES (per asset, ALPHA-style toggles + entryTag on the alert):
+//     entryL1 / entryS1 · G1-confirm bar entry, long / short (structural tighten stop, banded)
+//     entryL2 / entryS2 · mitigated wick entry, long / short (same structural stop as L1/S1, banded)
+// Engines are independent and run unconditionally; the strategies gate off them.
+//   Quarter · DQT Bias · Volume · Volatility · Structure (MSB + OB) · Trade Tracker
+// Library: Sniper_Ammo (structure BOS · order blocks · killzone resolver · bias · payload)
+// Tracker: breakeven @ 0.5R — stats/backtest only, NOT on the alert path.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("SNIPER_BRAVO", overlay = true, precision = 2,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+import Wen_Rich/Sniper_Ammo/14 as ammo
+
+// ═══ CONSTANTS ═══════════════════════════════════════════════════════════════
+int DIRECTION_NONE  = 0
+int DIRECTION_LONG  = 1
+int DIRECTION_SHORT = -1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── General ──
+generalGroup = "General"
+anchorTimezone = input.string("Australia/Sydney", "Timezone",
+     options = ["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney", "UTC"],
+     group = generalGroup, tooltip = "Quarter math, sessions and the weekly anchor use this timezone.")
+historyLookbackDays = input.int(3, "History / lookback (days)", minval = 1, maxval = 7, group = generalGroup)
+
+// ── Execution / Routing ──
+routingGroup = "Execution / Routing"
+executionTarget = input.string("dc_exness_mt5_01", "Execution target (MT5 instance)",
+     options = ["dc_exness_mt5_01", "nexus_ftmo_mt5_01"], group = routingGroup,
+     tooltip = "Routed into every payload's execution target. Pick the MT5 instance the bridge delivers to.")
+brokerSymbolOverride = input.string("", "Broker symbol override", group = routingGroup,
+     tooltip = "Optional MT5/Exness symbol override. Leave blank to use the TradingView ticker.")
+blockNewEntriesWhileTradeOpen = input.bool(true, "Block new entries while any trade is open", group = routingGroup,
+     tooltip = "One active trade across CBR L1, CBR L2 and F2. Developing setups are cleared while another engine is in trade.")
+
+// ── Quarterly Anchor ──
+quarterlyAnchorGroup = "Quarterly Anchor Time"
+sessionAnchorStartHour = input.int(10, "S1 start hour (local time)", minval = 0, maxval = 23, group = quarterlyAnchorGroup,
+     tooltip = "Local hour the quarterly structure anchors from. The 1h containers and 15m quarters tile forward from here.")
+
+// ── Quarter Visuals ──
+quarterVisualsGroup = "Quarter Visuals"
+showHourContainerBox = input.bool(true,  "Show hourly container",   group = quarterVisualsGroup)
+showQuarterBoxes     = input.bool(true,  "Show 15m quarter boxes",  group = quarterVisualsGroup)
+showQuarterLabels    = input.bool(false, "Show A/M/D/C labels",     group = quarterVisualsGroup)
+
+// ── Phase Colours ──
+phaseColoursGroup = "Phase Colours (A · M · D · C)"
+accumulationColor = input.color(color.new(#2962FF, 85), "A — Accumulation", group = phaseColoursGroup)
+manipulationColor = input.color(color.new(#E91E63, 85), "M — Manipulation", group = phaseColoursGroup)
+distributionColor = input.color(color.new(#26A69A, 85), "D — Distribution", group = phaseColoursGroup)
+continuationColor = input.color(color.new(#9E9E9E, 85), "C — Continuation", group = phaseColoursGroup)
+
+// ── Structure Engine ──
+structureGroup = "Structure"
+internalPivotLength   = input.int(10, "Internal pivot length", minval = 1, group = structureGroup, tooltip = "ammo.run internalLen — lower = more/earlier breaks. Drives BOS/MSB + OB anchoring.")
+swingPivotLength      = input.int(50, "Swing pivot length", minval = 1, group = structureGroup, tooltip = "ammo.run swingLen — the reference an internal break must DIFFER from to validate.")
+structureConfluence   = input.bool(true,  "Confluence filter", group = structureGroup, tooltip = "ammo.run confluence — also require a body-position confluence bar.")
+structurePresentMode  = input.bool(false, "Present mode (reuse latest line)", group = structureGroup, tooltip = "ammo.run present — true reuses one structure line; false keeps each historical break line.")
+showStructureBreaks   = input.bool(true, "Draw structure breaks", group = structureGroup)
+bullishStructureColor = input.color(#089981, "Bullish colour", group = structureGroup)
+bearishStructureColor = input.color(#f23645, "Bearish colour", group = structureGroup)
+
+// ── Order Block Engine ──
+orderBlockGroup = "Order Blocks"
+showOrderBlocks       = input.bool(true, "Show order blocks", group = orderBlockGroup)
+maxOrderBlocksKept    = input.int(5, "Max OBs kept / drawn", minval = 1, maxval = 20, group = orderBlockGroup,
+     tooltip = "Passed to the library SMC engine (run maxOB).")
+orderBlockFilter      = input.string("Atr", "OB volatility filter", options = ["Atr", "Cumulative Mean Range"], group = orderBlockGroup,
+     tooltip = "How the library anchors the OB candle. Atr = ATR(200); Cumulative Mean Range = running mean true range.")
+orderBlockMitigation  = input.string("High/Low", "OB mitigation", options = ["Close", "High/Low"], group = orderBlockGroup,
+     tooltip = "Close = OB dies only when price CLOSES through it. High/Low = a wick through removes it.")
+demandOrderBlockColor = input.color(color.new(#3179f5, 0), "Demand (bull) OB colour", group = orderBlockGroup)
+supplyOrderBlockColor = input.color(color.new(#f77c80, 0), "Supply (bear) OB colour", group = orderBlockGroup)
+
+// ── CBR Strategy ──
+cbrGroup = "CBR · Signals"
+cbrShowGate1Markers     = input.bool(true, "Mark Gate 1 (debug)", group = cbrGroup,
+     tooltip = "Marker at the manipulation quarter's first bar when its close lands beyond the previous candle container's high/low, showing the trade direction.")
+cbrGate1MarkerColor     = input.color(color.new(#AB47BC, 0), "Gate 1 marker colour", group = cbrGroup)
+cbrShowManipulationWick = input.bool(true, "Mark manipulation wick", group = cbrGroup,
+     tooltip = "↯ marker at the first tagged wick of the manipulation leg inside Q2 — only wicks whose extreme sits inside the previous candle container count; a wick through its far side invalidates the setup.")
+cbrWickMarkerColor      = input.color(color.new(#FFB300, 0), "Wick marker colour", group = cbrGroup)
+cbrEntryWaitBars        = input.int(3, "Entry wick wait (bars into Q3)", minval = 0, group = cbrGroup,
+     tooltip = "The reversal entry wick cannot fire until this many bars of the distribution quarter have completed (0 = the first Q3 bar is eligible). Lets the G2 extreme extend before entry — same idea as the F2 MSB wait.")
+cbrSignalColor          = input.color(color.new(#26C6DA, 0), "Signal colour", group = cbrGroup)
+
+// ── F2 Strategy ──
+f2Group = "F2 · Signals"
+f2ShowContainerShade      = input.bool(true, "Shade expansion container", group = f2Group,
+     tooltip = "Gate 1: a completed container that swept BOTH sides of the prior container. Its final-bar close direction sets the bias for the NEXT container.")
+f2ContainerBullishShade   = input.color(color.new(#26A69A, 80), "Bullish expansion shade", group = f2Group)
+f2ContainerBearishShade   = input.color(color.new(#EF5350, 80), "Bearish expansion shade", group = f2Group)
+f2ShowFailedQuarterMarker = input.bool(true, "Mark failed-2 quarter", group = f2Group,
+     tooltip = "Gate 2: a quarter of the armed container that swept ONE side of the prior quarter and failed to close past it. Marks the swept extreme.")
+f2FailedQuarterMarkerColor = input.color(color.new(#FFB300, 0), "Failed-2 marker colour", group = f2Group)
+f2MsbWaitBars = input.int(15, "MSB wait after failed-2 (bars)", minval = 0, group = f2Group,
+     tooltip = "Gate 3: after a failed-2 confirms, the entry waits up to this many bars for a fresh MSB in the bias direction (same bar counts). The wait survives the container boundary, so a failed-2 late in the container still gets its full window. MSB inside the window → entry at that bar's close. Window elapses → the trigger is dropped; a later failed-2 in the armed container can re-arm.")
+f2SignalColor             = input.color(color.new(#7E57C2, 0), "Signal colour", group = f2Group)
+
+// ── Risk & Stats ──
+riskStatsGroup = "Risk & Stats"
+// NOTE: the stop tighten % and min/max band are PER-STRATEGY, PER-ASSET —
+// see CbrConfig / F2Config in each asset block.
+showTradeZoneBoxes = input.bool(true, "Show SL/TP zone boxes", group = riskStatsGroup)
+showStatsTable     = input.bool(true, "Show stats table",      group = riskStatsGroup)
+riskDollarsPerR    = input.float(50, "Risk per 1R ($, stats only)", minval = 1, group = riskStatsGroup)
+moveStopToBreakeven = input.bool(true, "Move stop to breakeven at 50% of stop distance", group = riskStatsGroup,
+     tooltip = "TRACKER ONLY — never touches alerts/EA. Once price moves 0.5R in favour, the tracked stop moves to entry and the trade runs to target. Exits at entry count as BE (0R), not a loss.")
+
+// ── Dashboard ──
+dashboardGroup = "Dashboard"
+showUnifiedDashboard = input.bool(true, "Show SNIPER_BRAVO dashboard", group = dashboardGroup)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIG TYPES — the shape of an asset's configuration
+// ═══════════════════════════════════════════════════════════════════════════
+// Killzone schedule is HOST-HELD: a list of active CLOCK HOURS (ammo.KillzoneHour),
+// each carrying which quarters (A/M/D/C) trade in that hour. The library query
+// (ammo.isKillzoneOpen) reads the host's own hourLocal + quarterIndex — no separate
+// time math, so it can't drift from the container/quarter clock. ONE killzone per
+// asset, SHARED by both strategies (CBR / F2).
+type KillzoneConfig
+    bool   restrictEnabled
+    array<ammo.KillzoneHour> activeHours
+
+// Shared bias / volume settings (was ShCfg, minus the stop toggle)
+type SharedConfig
+    bool   volumeGateEnabled
+    float  volumeThreshold
+    int    biasConfirmCount
+
+// CBR strategy — A·M·D reversal, container/quarter-anchored.
+//   targetRMultiples : per entry mode — target = multiple × the stop distance
+//   ENTRY MODES (per asset, PER DIRECTION — four booleans; all fire into the
+//   ONE CBR tracker and the ONE CBR alert path, tagged L1/S1 · L2/S2):
+//     entryL1 / entryS1 · immediate entry at the G1 confirm bar's close
+//               (L1 = LONG confirms, S1 = SHORT confirms).
+//               STOP = tighten % of the measured distance close → the just-closed
+//               Q1's push-side extreme (high for SHORT / low for LONG), then
+//               bounded by the per-asset min/max band.
+//     entryL2 / entryS2 · the mitigated wick entry (L2 = LONG, S2 = SHORT).
+//               G3 (the Q2 origin wick / mitigation) occurs first, then the G2
+//               entry wick in Q3 — higher conviction. STOP = same methodology
+//               as L1/S1: tighten % of close → the previously closed quarter's
+//               (Q2's) relevant extreme, then bounded by the band.
+type CbrConfig
+    bool   enabled              // gates the whole CBR machine (G1 flag onward)
+    float  wickRatio
+    float  stopTightenPercent   // % of the measured close→structural-extreme distance
+    float  minStopPercent       // tightened stop closer than this (% of price) → widened to this
+    float  maxStopPercent       // tightened stop wider than this (% of price) → entry skipped
+    float  l1TargetRMultiple
+    float  l2TargetRMultiple
+    bool   entryL1
+    bool   entryS1
+    bool   entryL2
+    bool   entryS2
+
+// F2 strategy — gate framework v3 (expansion → failed-2 → MSB entry).
+// No bias mode, no killzone, no FVG, no wick trigger. Entry fires on the first
+// same-direction structure break after a failed-2 arms. STOP = the CBR-L1
+// structural methodology: measure close → the previously CLOSED quarter's
+// relevant extreme (low for LONG / high for SHORT), tighten to F2's own
+// per-asset stop-tighten %, then bounded by F2's per-asset min/max band. Target = fixed R
+// off the stop distance. No resolveEntry.
+type F2Config
+    bool   enabled
+    float  stopTightenPercent   // % of the measured close→structural-extreme distance
+    float  minStopPercent       // tightened stop closer than this (% of price) → widened to this
+    float  maxStopPercent       // tightened stop wider than this (% of price) → entry skipped
+    float  targetRMultiple
+
+type AssetConfig
+    string         assetCode
+    bool           isKnownAsset
+    SharedConfig   shared
+    KillzoneConfig killzone        // shared by CBR / F2
+    CbrConfig      cbr
+    F2Config       f2
+
+// ── killzone helper ──────────────────────────────────────────────────────────
+// Within each active hour ALL quarters trade — A/M/D/C. The continuation
+// quarter is open because CBR's Gate 1 confirm reads the PREVIOUS container's
+// Q4 as its reference quarter.
+reversalHour(int hourOfDay) =>
+    ammo.KillzoneHour.new(hourOfDay, true, true, true, true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PER-ASSET CONFIG — one self-contained block per asset (no base + override).
+// Each block spells out EVERYTHING that asset uses: the strategy enables,
+// every strategy's tuning (entry modes, targets), and its killzone hours inline.
+// Read one block top-to-bottom and you know exactly how that asset trades.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── XAU (gold) — also the fallback for unknown tickers ──
+buildConfigXAUUSD(string assetCode, bool isKnownAsset) =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(1))
+    array.push(killzoneHours, reversalHour(2))
+    array.push(killzoneHours, reversalHour(3))
+    array.push(killzoneHours, reversalHour(4))
+    array.push(killzoneHours, reversalHour(5))
+    array.push(killzoneHours, reversalHour(10))
+    array.push(killzoneHours, reversalHour(11))
+    array.push(killzoneHours, reversalHour(12))
+    array.push(killzoneHours, reversalHour(13))
+    array.push(killzoneHours, reversalHour(14))
+    array.push(killzoneHours, reversalHour(15))
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(19))
+    array.push(killzoneHours, reversalHour(20)) 
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    AssetConfig.new(assetCode, isKnownAsset,
+         SharedConfig.new(volumeGateEnabled = false, volumeThreshold = 1.5, biasConfirmCount = 1),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.10, stopTightenPercent = 50, minStopPercent = 0.15, maxStopPercent = 0.20, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 50, minStopPercent = 0.10, maxStopPercent = 0.20, targetRMultiple = 1.5))
+
+
+// ── AUDJPY ──
+buildConfigAUDJPY() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(10))
+    array.push(killzoneHours, reversalHour(11))
+    array.push(killzoneHours, reversalHour(12))
+    array.push(killzoneHours, reversalHour(13))
+    array.push(killzoneHours, reversalHour(14))
+    array.push(killzoneHours, reversalHour(15))
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(19))
+    array.push(killzoneHours, reversalHour(20)) 
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    AssetConfig.new("AUDJPY", true,
+         SharedConfig.new(volumeGateEnabled = false, volumeThreshold = 1.5, biasConfirmCount = 1),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.1, stopTightenPercent = 50, minStopPercent = 0.05, maxStopPercent = 0.08, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 30, minStopPercent = 0.05, maxStopPercent = 0.15, targetRMultiple = 1.0))
+
+// ── AUDUSD ──
+buildConfigAUDUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(10))
+    array.push(killzoneHours, reversalHour(11))
+    array.push(killzoneHours, reversalHour(12))
+    array.push(killzoneHours, reversalHour(13))
+    array.push(killzoneHours, reversalHour(14))
+    array.push(killzoneHours, reversalHour(15))
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(19))
+    array.push(killzoneHours, reversalHour(20)) 
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    AssetConfig.new("AUDUSD", true,
+         SharedConfig.new(volumeGateEnabled = false, volumeThreshold = 1.5, biasConfirmCount = 1),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.1, stopTightenPercent = 50, minStopPercent = 0.06, maxStopPercent = 0.10, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 30, minStopPercent = 0.05, maxStopPercent = 0.15, targetRMultiple = 1.0))
+
+// ── EURUSD ──
+buildConfigEURUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(1))
+    array.push(killzoneHours, reversalHour(2))
+    array.push(killzoneHours, reversalHour(3))
+    array.push(killzoneHours, reversalHour(4))
+    array.push(killzoneHours, reversalHour(5))
+    array.push(killzoneHours, reversalHour(12))
+    array.push(killzoneHours, reversalHour(13))
+    array.push(killzoneHours, reversalHour(14))
+    array.push(killzoneHours, reversalHour(15))
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(19))
+    array.push(killzoneHours, reversalHour(20))
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    AssetConfig.new("EURUSD", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 1),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.1, stopTightenPercent = 50, minStopPercent = 0.03, maxStopPercent = 0.05, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 30, minStopPercent = 0.04, maxStopPercent = 0.12, targetRMultiple = 1.0))
+
+// ── GBPJPY ──
+buildConfigGBPJPY() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(0))
+    array.push(killzoneHours, reversalHour(1))
+    array.push(killzoneHours, reversalHour(2))  
+    array.push(killzoneHours, reversalHour(12))
+    array.push(killzoneHours, reversalHour(13))
+    array.push(killzoneHours, reversalHour(14))
+    array.push(killzoneHours, reversalHour(15))
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(19))
+    array.push(killzoneHours, reversalHour(20))
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    AssetConfig.new("GBPJPY", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 1),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.10, stopTightenPercent = 50, minStopPercent = 0.05, maxStopPercent = 0.12, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 30, minStopPercent = 0.07, maxStopPercent = 0.21, targetRMultiple = 1.0))
+
+// ── GBPUSD ──
+buildConfigGBPUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(0))
+    array.push(killzoneHours, reversalHour(1))
+    array.push(killzoneHours, reversalHour(2))
+    array.push(killzoneHours, reversalHour(3))
+    array.push(killzoneHours, reversalHour(4))
+    array.push(killzoneHours, reversalHour(5))
+    array.push(killzoneHours, reversalHour(6))
+    array.push(killzoneHours, reversalHour(8))
+    array.push(killzoneHours, reversalHour(9))
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(19))
+    array.push(killzoneHours, reversalHour(20))
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    AssetConfig.new("GBPUSD", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.1, stopTightenPercent = 50, minStopPercent = 0.06, maxStopPercent = 0.10, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 30, minStopPercent = 0.05, maxStopPercent = 0.15, targetRMultiple = 1.0))
+
+// ── GBPUSD ──
+buildConfigUSDCHF() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, reversalHour(16))
+    array.push(killzoneHours, reversalHour(17))
+    array.push(killzoneHours, reversalHour(18))
+    array.push(killzoneHours, reversalHour(20))
+    array.push(killzoneHours, reversalHour(21))
+    array.push(killzoneHours, reversalHour(22))
+    array.push(killzoneHours, reversalHour(23))
+    array.push(killzoneHours, reversalHour(0))
+    array.push(killzoneHours, reversalHour(1))
+    array.push(killzoneHours, reversalHour(2))
+    array.push(killzoneHours, reversalHour(3))
+    array.push(killzoneHours, reversalHour(4))
+    array.push(killzoneHours, reversalHour(5))
+    array.push(killzoneHours, reversalHour(6))
+    AssetConfig.new("USDCHF", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         CbrConfig.new(enabled = true, wickRatio = 0.1, stopTightenPercent = 50, minStopPercent = 0.05, maxStopPercent = 0.10, l1TargetRMultiple = 1.0, l2TargetRMultiple = 3.0, entryL1 = true, entryS1 = true, entryL2 = true, entryS2 = true),
+         F2Config.new(enabled = false, stopTightenPercent = 30, minStopPercent = 0.05, maxStopPercent = 0.15, targetRMultiple = 1.0))
+
+
+// ── asset router — ticker → its config block ──
+detectAsset() =>
+    string upperTicker = str.upper(syminfo.ticker)
+    AssetConfig assetConfig = na
+    if str.contains(upperTicker, "XAUUSD") or str.contains(upperTicker, "GOLD")
+        assetConfig := buildConfigXAUUSD("XAUUSD", true)
+    else if str.contains(upperTicker, "AUDUSD") or str.contains(upperTicker, "AUD/USD")
+        assetConfig := buildConfigAUDUSD()
+    else if str.contains(upperTicker, "AUDJPY") or str.contains(upperTicker, "AUD/JPY")
+        assetConfig := buildConfigAUDJPY()
+    else if str.contains(upperTicker, "GBPUSD") or str.contains(upperTicker, "GBP/USD")
+        assetConfig := buildConfigGBPUSD()
+    else if str.contains(upperTicker, "GBPJPY") or str.contains(upperTicker, "GBP/JPY")
+        assetConfig := buildConfigGBPJPY()
+    else if str.contains(upperTicker, "EURUSD") or str.contains(upperTicker, "EUR/USD")
+        assetConfig := buildConfigEURUSD()
+    else if str.contains(upperTicker, "USDCHF") or str.contains(upperTicker, "USD/CHF")
+        assetConfig := buildConfigUSDCHF()    
+    else
+        assetConfig := buildConfigXAUUSD("UNK", false)
+    assetConfig
+
+var AssetConfig assetConfig = detectAsset()
+
+var table unknownAssetWarning = table.new(position.top_left, 1, 1)
+if barstate.islast and not assetConfig.isKnownAsset
+    table.cell(unknownAssetWarning, 0, 0, "⚠ " + syminfo.ticker + " not in config — using XAU defaults", text_color = color.white, bgcolor = color.new(color.red, 0), text_size = size.small)
+
+// ═══ CURRENT TIME ════════════════════════════════════════════════════════════
+hourLocal   = hour  (time, anchorTimezone)
+minuteLocal = minute(time, anchorTimezone)
+phaseLetter(int quarterIndex) => quarterIndex == 1 ? "A" : quarterIndex == 2 ? "M" : quarterIndex == 3 ? "D" : "C"
+phaseColor(int quarterIndex)  => quarterIndex == 1 ? accumulationColor : quarterIndex == 2 ? manipulationColor : quarterIndex == 3 ? distributionColor : continuationColor
+string timestampLocal = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssXXX", anchorTimezone)
+string timestampUtc   = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+
+// ═══ TIME MATH — resolve via library ═════════════════════════════════════════
+[containerIndex, quarterIndex]                            = ammo.resolveContainerQuarter(time, anchorTimezone, sessionAnchorStartHour)
+string killzoneWindowName                                 = ammo.sessionName(hourLocal)
+dexBlackout() => ammo.isWeekendBlackout(time, anchorTimezone, sessionAnchorStartHour)
+
+// ═══ QUARTERLY ENGINE — VISUAL OUTPUT ════════════════════════════════════════
+type ContainerVisual
+    int   containerKey  = na
+    box   containerBox  = na
+    float runningHigh   = na
+    float runningLow    = na
+
+type QuarterVisual
+    int   quarterKey   = na
+    box   quarterBox   = na
+    label quarterLabel = na
+
+var ContainerVisual currentContainerVisual = ContainerVisual.new()
+var QuarterVisual   currentQuarterVisual   = QuarterVisual.new()
+var array<box>           containerBoxHistory  = array.new<box>()
+var array<QuarterVisual> quarterVisualHistory = array.new<QuarterVisual>()
+
+int containerBoxCap = math.min(historyLookbackDays * 24, 80)
+int quarterBoxCap   = math.min(historyLookbackDays * 96, 300)
+
+capContainerBoxHistory(array<box> boxHistory, box newBox, int cap) =>
+    array.push(boxHistory, newBox)
+    while array.size(boxHistory) > cap
+        box oldestBox = array.shift(boxHistory)
+        if not na(oldestBox)
+            box.delete(oldestBox)
+
+capQuarterVisualHistory(array<QuarterVisual> visualHistory, QuarterVisual newVisual, int cap) =>
+    array.push(visualHistory, newVisual)
+    while array.size(visualHistory) > cap
+        QuarterVisual oldestVisual = array.shift(visualHistory)
+        if not na(oldestVisual)
+            if not na(oldestVisual.quarterBox)
+                box.delete(oldestVisual.quarterBox)
+            if not na(oldestVisual.quarterLabel)
+                label.delete(oldestVisual.quarterLabel)
+
+updateContainerVisual() =>
+    bool isNewContainer = na(currentContainerVisual.containerKey) or currentContainerVisual.containerKey != containerIndex
+    if isNewContainer
+        if not na(currentContainerVisual.containerBox)
+            box.set_right(currentContainerVisual.containerBox, time)
+        currentContainerVisual.runningHigh  := high
+        currentContainerVisual.runningLow   := low
+        currentContainerVisual.containerKey := containerIndex
+        if showHourContainerBox
+            box newContainerBox = box.new(time, high, time, low, xloc = xloc.bar_time,
+                 border_color = color.new(color.orange, 40), border_style = line.style_dashed, bgcolor = color.new(color.gray, 100))
+            capContainerBoxHistory(containerBoxHistory, newContainerBox, containerBoxCap)
+            currentContainerVisual.containerBox := newContainerBox
+    else
+        currentContainerVisual.runningHigh := math.max(currentContainerVisual.runningHigh, high)
+        currentContainerVisual.runningLow  := math.min(currentContainerVisual.runningLow,  low)
+        if showHourContainerBox and not na(currentContainerVisual.containerBox)
+            box.set_top   (currentContainerVisual.containerBox, currentContainerVisual.runningHigh)
+            box.set_bottom(currentContainerVisual.containerBox, currentContainerVisual.runningLow)
+            box.set_right (currentContainerVisual.containerBox, time)
+    int(na)
+
+updateQuarterVisual() =>
+    int quarterKey = containerIndex * 10 + quarterIndex
+    color quarterColor = phaseColor(quarterIndex)
+    bool isNewQuarter = na(currentQuarterVisual.quarterKey) or currentQuarterVisual.quarterKey != quarterKey
+    if isNewQuarter
+        box newQuarterBox = box.new(time, high, time_close, low, xloc = xloc.bar_time,
+             border_color = color.new(quarterColor, 30), border_style = line.style_dotted, bgcolor = quarterColor)
+        label newQuarterLabel = na
+        if showQuarterLabels
+            newQuarterLabel := label.new(time + 450000, (high + low) / 2, phaseLetter(quarterIndex),
+                 xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, textcolor = color.white, size = size.normal)
+        QuarterVisual newQuarterVisual = QuarterVisual.new(quarterKey, newQuarterBox, newQuarterLabel)
+        capQuarterVisualHistory(quarterVisualHistory, newQuarterVisual, quarterBoxCap)
+        currentQuarterVisual.quarterKey   := newQuarterVisual.quarterKey
+        currentQuarterVisual.quarterBox   := newQuarterVisual.quarterBox
+        currentQuarterVisual.quarterLabel := newQuarterVisual.quarterLabel
+    if not isNewQuarter and not na(currentQuarterVisual.quarterBox)
+        box.set_right (currentQuarterVisual.quarterBox, time_close)
+        box.set_top   (currentQuarterVisual.quarterBox, math.max(box.get_top   (currentQuarterVisual.quarterBox), high))
+        box.set_bottom(currentQuarterVisual.quarterBox, math.min(box.get_bottom(currentQuarterVisual.quarterBox), low))
+        if showQuarterLabels and not na(currentQuarterVisual.quarterLabel)
+            label.set_y(currentQuarterVisual.quarterLabel, (box.get_top(currentQuarterVisual.quarterBox) + box.get_bottom(currentQuarterVisual.quarterBox)) / 2)
+    int(na)
+
+if not dexBlackout()
+    updateContainerVisual()
+    if showQuarterBoxes
+        updateQuarterVisual()
+
+// container sequence — one ever-increasing number per container
+// (consumed by F2's armed-container scoping)
+var int containerSequence = 0
+if ta.change(containerIndex) != 0
+    containerSequence += 1
+
+// ═══ PERIOD ENGINE — ONE candle container + ONE quarter, shared by everything ══
+// The candle container (currently 1h aggregation) and the 15m quarter are
+// accumulated ONCE here via the library (current forming period + the last two
+// closed). Bias reads the quarter, CBR reads both, F2 reads both. No strategy
+// keeps its own copy.
+var ammo.PeriodOHLC candleContainer  = ammo.PeriodOHLC.new()
+var ammo.PeriodOHLC quarterOHLC = ammo.PeriodOHLC.new()
+ammo.advancePeriod(candleContainer,  containerIndex, bar_index, open, high, low, close)
+ammo.advancePeriod(quarterOHLC, containerIndex * 10 + quarterIndex, bar_index, open, high, low, close)
+bool containerRolled = candleContainer.justClosed
+bool quarterRolled   = quarterOHLC.justClosed
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCAL ENGINE CONFIGS
+// ═══════════════════════════════════════════════════════════════════════════
+biasConfirmCount     = assetConfig.shared.biasConfirmCount
+volumeFilterEnabled  = assetConfig.shared.volumeGateEnabled
+volumeMultiplier     = assetConfig.shared.volumeThreshold
+volumeAverageLength  = 20
+
+
+// CBR — A·M·D reversal. ONE tracker + ONE alert path; per-direction entry
+// booleans fire into it with an entryTag:
+//   entryL1 / entryS1 · G1 confirm bar (long / short); stop = tighten % of close →
+//       Q1's push-side extreme (the previously closed quarter), band-clamped.
+//   entryL2 / entryS2 · mitigated wick entry (long / short); stop = SAME as
+//       L1/S1: tighten % of close → the previously closed quarter's (Q2's)
+//       relevant extreme, band-clamped.
+cbrEnabled           = assetConfig.cbr.enabled
+cbrWickRatio         = assetConfig.cbr.wickRatio
+cbrStopTightenFraction = assetConfig.cbr.stopTightenPercent / 100.0
+cbrMinStopDistance   = ammo.percentToDistance(close, assetConfig.cbr.minStopPercent)
+cbrMaxStopDistance   = ammo.percentToDistance(close, assetConfig.cbr.maxStopPercent)
+cbrL1TargetRMultiple = assetConfig.cbr.l1TargetRMultiple
+cbrL2TargetRMultiple = assetConfig.cbr.l2TargetRMultiple
+cbrEntryL1           = assetConfig.cbr.entryL1
+cbrEntryS1           = assetConfig.cbr.entryS1
+cbrEntryL2           = assetConfig.cbr.entryL2
+cbrEntryS2           = assetConfig.cbr.entryS2
+
+// F2 — gate framework v3. Stop = the CBR-L1 structural methodology: tighten %
+// of close → the previously CLOSED quarter's relevant extreme, band-clamped.
+f2Enabled          = assetConfig.f2.enabled
+f2StopTightenFraction = assetConfig.f2.stopTightenPercent / 100.0
+f2MinStopDistance  = ammo.percentToDistance(close, assetConfig.f2.minStopPercent)
+f2MaxStopDistance  = ammo.percentToDistance(close, assetConfig.f2.maxStopPercent)
+f2TargetRMultiple  = assetConfig.f2.targetRMultiple
+
+// killzone (shared by all three strategies)
+killzoneConfig = assetConfig.killzone
+
+// ═══ STRUCTURE ENGINE — library SMC ══════════════════════════════════════════
+var ammo.smcState structureState = ammo.newState()
+ammo.smcResult structureResult = ammo.run(internalLen = internalPivotLength, swingLen = swingPivotLength,
+     confluence = structureConfluence, present = structurePresentMode,
+     showMSB = showStructureBreaks, bullCol = bullishStructureColor, bearCol = bearishStructureColor,
+     showOB = showOrderBlocks, maxOB = maxOrderBlocksKept, obFilter = orderBlockFilter, obMitigation = orderBlockMitigation, obBullCol = demandOrderBlockColor, obBearCol = supplyOrderBlockColor,
+     showFVG = false, st = structureState)
+bool bullishStructureBreak = structureResult.bosBull
+bool bearishStructureBreak = structureResult.bosBear
+bool bullishReversalBreak  = structureResult.msbBull
+bool bearishReversalBreak  = structureResult.msbBear
+bool structureBreakBull    = bullishStructureBreak or bullishReversalBreak
+bool structureBreakBear    = bearishStructureBreak or bearishReversalBreak
+float lastPivotHigh = structureResult.lastPivotHigh
+float lastPivotLow  = structureResult.lastPivotLow
+
+
+// ═══ VOLUME ENGINE ═══════════════════════════════════════════════════════════
+float volumeAverage   = ta.sma(volume, volumeAverageLength)
+bool  volumeConfirmed = not na(volume) and not na(volumeAverage) and volumeAverage > 0 and volume > volumeAverage * volumeMultiplier
+
+// ═══ BIAS ENGINE — 1m → 15m quarter accumulation ═════════════════════════════
+type BiasVerdict
+    int   ratifiedBiasId  = 0
+    int   marketStateId   = 0
+    int   closeTime       = na
+    int   spotBiasId      = 0
+    int   bullishStreak   = 0
+    int   bearishStreak   = 0
+
+var BiasVerdict biasVerdict = BiasVerdict.new()
+
+// reads the SHARED quarterOHLC (period engine); evaluation still skips blackout
+if not dexBlackout()
+    if quarterRolled and not na(quarterOHLC.previousClosedHigh)
+        [spotBias, marketState] = ammo.evaluateBias(quarterOHLC.closedHigh, quarterOHLC.closedLow, quarterOHLC.previousClosedHigh, quarterOHLC.previousClosedLow)
+        if spotBias == ammo.BIAS_BULLISH
+            biasVerdict.bullishStreak := biasVerdict.bullishStreak + 1
+            biasVerdict.bearishStreak := 0
+        if spotBias == ammo.BIAS_BEARISH
+            biasVerdict.bearishStreak := biasVerdict.bearishStreak + 1
+            biasVerdict.bullishStreak := 0
+        if spotBias == ammo.BIAS_RANGING
+            biasVerdict.bullishStreak := 0
+            biasVerdict.bearishStreak := 0
+        int ratifiedBias = ammo.BIAS_RANGING
+        if biasVerdict.bullishStreak >= biasConfirmCount
+            ratifiedBias := ammo.BIAS_BULLISH
+        if biasVerdict.bearishStreak >= biasConfirmCount
+            ratifiedBias := ammo.BIAS_BEARISH
+        biasVerdict.spotBiasId     := spotBias
+        biasVerdict.ratifiedBiasId := ratifiedBias
+        biasVerdict.marketStateId  := marketState
+        biasVerdict.closeTime      := time
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRADE TRACKER ENGINE — shared type, one open position across all strategies
+// ───────────────────────────────────────────────────────────────────────────
+// Breakeven (tracker only — never on the alert path):
+//   Once price moves 50% of the ORIGINAL stop distance (0.5R) in favour, the
+//   tracked stop moves to entry ONCE and the trade runs to the original target.
+//   Exit at entry after the move records 0R (breakeven), not a loss.
+//   R multiples are always measured against initialRisk (the original stop),
+//   never the moved stop.
+// ═══════════════════════════════════════════════════════════════════════════
+type StrategyTrade
+    int   direction   = 0
+    float entryPrice  = na
+    float stopPrice   = na
+    float targetPrice = na
+    float initialRisk = na
+    bool  beArmed     = false
+    bool  open        = false
+    box   stopBox     = na
+    box   targetBox   = na
+
+resolveStrategyTrade(StrategyTrade strategyTrade) =>
+    bool  stillOpen         = strategyTrade.open
+    float realisedRMultiple = na
+    if strategyTrade.open and not na(strategyTrade.stopPrice) and not na(strategyTrade.targetPrice)
+        float riskDistance = na(strategyTrade.initialRisk) ? math.abs(strategyTrade.entryPrice - strategyTrade.stopPrice) : strategyTrade.initialRisk
+        // ── breakeven arm — 0.5R in favour → stop walks to entry (once) ──
+        if moveStopToBreakeven and not strategyTrade.beArmed and riskDistance > 0
+            float beTrigger = strategyTrade.direction == DIRECTION_LONG ?
+                 strategyTrade.entryPrice + 0.5 * riskDistance :
+                 strategyTrade.entryPrice - 0.5 * riskDistance
+            if (strategyTrade.direction == DIRECTION_LONG and high >= beTrigger) or (strategyTrade.direction == DIRECTION_SHORT and low <= beTrigger)
+                strategyTrade.stopPrice := strategyTrade.entryPrice
+                strategyTrade.beArmed   := true
+                if not na(strategyTrade.stopBox)
+                    box.set_top   (strategyTrade.stopBox, strategyTrade.entryPrice)
+                    box.set_bottom(strategyTrade.stopBox, strategyTrade.entryPrice)
+        // ── exits — BE-armed stop-outs record 0R; losses only from the original stop ──
+        if strategyTrade.direction == DIRECTION_LONG
+            if low <= strategyTrade.stopPrice
+                stillOpen         := false
+                realisedRMultiple := strategyTrade.beArmed ? 0.0 : -1.0
+            else if high >= strategyTrade.targetPrice
+                stillOpen         := false
+                realisedRMultiple := riskDistance > 0 ? (strategyTrade.targetPrice - strategyTrade.entryPrice) / riskDistance : 0.0
+        else
+            if high >= strategyTrade.stopPrice
+                stillOpen         := false
+                realisedRMultiple := strategyTrade.beArmed ? 0.0 : -1.0
+            else if low <= strategyTrade.targetPrice
+                stillOpen         := false
+                realisedRMultiple := riskDistance > 0 ? (strategyTrade.entryPrice - strategyTrade.targetPrice) / riskDistance : 0.0
+    [stillOpen, realisedRMultiple]
+
+// CBR L1 / F2 structural stop — measure the distance from the signal candle's
+// CLOSE (entry) to the structural level (the previously closed quarter's
+// relevant high/low), place the stop at tightenFraction of that distance from
+// entry (0.5 = 50% tighten), then apply the per-asset BAND:
+//   tightened distance < minDistance → stop WIDENED to minDistance
+//   tightened distance > maxDistance → na (entry SKIPPED)
+// A na or wrong-side structural level also returns na so the geometry guard
+// rejects the trade.
+tightenedStructuralStop(int direction, float entryPrice, float structuralLevel, float tightenFraction, float minDistance, float maxDistance) =>
+    float stopLevel = na
+    if not na(structuralLevel)
+        float measuredDistance = direction == DIRECTION_LONG ? entryPrice - structuralLevel : structuralLevel - entryPrice
+        if measuredDistance > 0
+            float stopDistance = tightenFraction * measuredDistance
+            if stopDistance < minDistance
+                stopDistance := minDistance
+            if stopDistance <= maxDistance
+                stopLevel := direction == DIRECTION_LONG ? entryPrice - stopDistance : entryPrice + stopDistance
+    stopLevel
+
+// grey debug marker when an entry is SKIPPED (band max / invalid geometry)
+skipMarker(bool isLong, string tag) =>
+    label.new(bar_index, isLong ? low : high, "SKIP·" + tag, xloc = xloc.bar_index,
+         yloc = isLong ? yloc.belowbar : yloc.abovebar,
+         style = isLong ? label.style_label_up : label.style_label_down,
+         color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+    int(na)
+
+zoneBox(float topPrice, float bottomPrice, color zoneColor) =>
+    box.new(time, topPrice, time, bottomPrice, bgcolor = color.new(zoneColor, 80), border_color = color.new(zoneColor, 60), xloc = xloc.bar_time)
+
+var StrategyTrade cbrTrade = StrategyTrade.new()   // CBR — all entry modes (L1/L2) fill this one slot
+var StrategyTrade f2Trade  = StrategyTrade.new()
+
+anyTradeOpen() => cbrTrade.open or f2Trade.open
+tradeEntryAllowed() => not blockNewEntriesWhileTradeOpen or not anyTradeOpen()
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FA_1: CBR STRATEGY — A·M·D reversal (container/quarter-anchored)
+// ───────────────────────────────────────────────────────────────────────────
+//   GATE 1 · OVEREXTENSION — two structural opens, same behaviour, same direction:
+//       FLAG   · the ACCUMULATION quarter's FIRST bar (container open) closes
+//                beyond the PREVIOUS candle container's high/low.
+//       CONFIRM· the ACCUMULATION quarter as a whole vs the PREVIOUS
+//                container's CONTINUATION quarter (Q4), evaluated once at
+//                Q1's close, same direction as the flag:
+//                  flag up   + Q1 higher high AND higher low → trade SHORT
+//                  flag down + Q1 lower low  AND lower high → trade LONG
+//                No shift → the flag dies. Killzone at the flag.
+//       The G1 FLAG = Q1's push-side extreme (its high for SHORT / low for LONG).
+//   ── ENTRY MODES (per asset, PER DIRECTION — four booleans; ONE tracker,
+//      ONE alert path, the fired mode carried on the alert as entryTag) ──
+//     entryL1 / entryS1 · staged entry, fires IMMEDIATELY at the G1 confirm
+//       bar's close (entryL1 gates LONG confirms, entryS1 gates SHORT).
+//       STOP — measure close → the previously closed quarter's (Q1's)
+//       push-side extreme, tighten to the configurable % of that distance
+//       (default 50%), band-clamped.
+//       TARGET — l1TargetRMultiple off the stop distance.
+//     entryL2 / entryS2 · the mitigated wick entry — the gates below
+//       (entryL2 gates the LONG fire, entryS2 the SHORT). G3 (mitigation of
+//       the Q2 origin) occurs first, then G2 — higher conviction.
+//       STOP — same methodology as L1/S1 (close → Q2's relevant extreme,
+//       tightened, band-clamped). TARGET — l2TargetRMultiple. ──
+//   GATE 2 · ENTRY WICK (DISTRIBUTION quarter · Q3)
+//       The first wick candle on the SAME side as the G1 extreme (upper wick
+//       for SHORT / lower for LONG, ≥ wickRatio of the bar range) whose extreme
+//       IS the distribution quarter's running extreme — the highest high since
+//       Q3's first bar (SHORT) / lowest low (LONG). While the extreme keeps
+//       extending, earlier wicks are skipped, letting the G2 extreme extend
+//       before entry. A configurable wait (cbrEntryWaitBars input) additionally
+//       holds the wick back until that many Q3 bars have completed. Its wick
+//       extreme is the G2 FLAG; the trade fires at this bar's close once the
+//       Gate 3 lookback validates it.
+//   GATE 3 · VALIDATION (lookback to the CLOSED manipulation quarter)
+//       Q2 has closed, so its high/low is fixed. The G3 FLAG = the manipulation
+//       quarter's extreme OPPOSITE to G1 — the ORIGIN of the manipulated move
+//       (Q2 LOW for SHORT / Q2 HIGH for LONG) — and it must be a WICK touch
+//       (the quarter-candle wicked there, not closed there). Flag distances:
+//         D1 = G1 flag → G3 flag  · the FULL manipulated move
+//         D3 = G3 flag → G2 flag  · the entry wick's distance from the origin
+//       VALID when the entry wick has RETRACED AT LEAST 50% of D1 — the G2
+//       flag at/past the midline of G1→G3 (D3 ≤ 50% of D1). The G3 mitigation
+//       is fixed at Q2's close, so it ALWAYS precedes the G2 wick (G3 → G2
+//       ordering by construction). Failing → that wick is skipped; later Q3
+//       wicks can still qualify. No entry by the end of Q3 → the setup dies.
+//   L2 STOP  — SAME methodology as L1/S1: measure close → the previously
+//       closed quarter's (Q2's) relevant extreme (high for SHORT / low for
+//       LONG), stop at the tighten % of that distance, band-clamped.
+//   L2 TARGET — l2TargetRMultiple off the stop distance.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══ FILTERS ═════════════════════════════════════════════════════════════════
+bool cbrKillzoneOpen = not killzoneConfig.restrictEnabled or ammo.isKillzoneOpen(killzoneConfig.activeHours, hourLocal, quarterIndex)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPEN-TRADE MANAGEMENT — runs every bar (independent of the setup sequence)
+// ═══════════════════════════════════════════════════════════════════════════
+var int   cbrWinCount       = 0
+var int   cbrLossCount      = 0
+var int   cbrBreakevenCount = 0
+var float cbrNetRMultiple   = 0.0
+[cbrStillOpen, cbrRealisedR] = resolveStrategyTrade(cbrTrade)
+cbrTrade.open := cbrStillOpen
+if not na(cbrRealisedR)
+    cbrWinCount       += cbrRealisedR > 0 ? 1 : 0
+    cbrLossCount      += cbrRealisedR < 0 ? 1 : 0
+    cbrBreakevenCount += cbrRealisedR == 0 ? 1 : 0
+    cbrNetRMultiple   += cbrRealisedR
+if cbrTrade.open and not na(cbrTrade.stopBox)
+    box.set_right(cbrTrade.stopBox, time)
+    box.set_right(cbrTrade.targetBox, time)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP SEQUENCE — G1 flag → G1 confirm (L1 fire) → validated wick entry in Q3 (L2)
+// ═══════════════════════════════════════════════════════════════════════════
+var int   cbrFlagPushDir = 0     // +1 push up / -1 push down — set at the container's FIRST bar (Q1 open)
+var int   cbrSetupDir    = 0
+var float cbrG1Extreme   = na    // the G1 confirm candle's extreme (the G1 FLAG)
+var float cbrQ2Extreme   = na    // running Q2 extreme in the push direction (becomes the G3 FLAG)
+var int   cbrQ2ExtremeBar = na   // the bar that made it — anchors the G3 marker
+var float cbrQ3High      = na    // distribution quarter running HIGH — a SHORT's G2 wick must BE this
+var float cbrQ3Low       = na    // distribution quarter running LOW  — a LONG's G2 wick must BE this
+// funnel diagnostics — where do setups die? (stats table row)
+var int   cbrFlagCount    = 0    // Q1-open flags
+var int   cbrConfirmCount = 0    // G1 confirms (armed setups)
+var int   cbrQ3AliveCount = 0    // setups still alive when the distribution quarter opens
+var int   cbrL2FireCount  = 0    // L2 (mitigated wick) fires — the funnel's terminal count
+
+// signals produced by the fire stages (consumed by FILL below)
+bool  cbrLong  = false
+bool  cbrShort = false
+float cbrEntryPrice  = na
+float cbrStopPrice   = na
+float cbrTargetPrice = na
+string cbrEntryTag   = "L2"   // "L1"/"S1" G1-confirm entry · "L2"/"S2" mitigated wick entry
+
+// a container roll resets the sequence (the setup lives inside ONE container's A·M·D)
+if containerRolled
+    cbrFlagPushDir := 0
+    cbrSetupDir    := 0
+    cbrG1Extreme   := na
+    cbrQ2Extreme   := na
+    cbrQ2ExtremeBar := na
+    cbrQ3High      := na
+    cbrQ3Low       := na
+
+// global lock drops a developing setup
+if blockNewEntriesWhileTradeOpen and anyTradeOpen() and not cbrTrade.open and (cbrSetupDir != 0 or cbrFlagPushDir != 0)
+    cbrFlagPushDir := 0
+    cbrSetupDir    := 0
+    cbrG1Extreme   := na
+    cbrQ2Extreme   := na
+    cbrQ2ExtremeBar := na
+    cbrQ3High      := na
+    cbrQ3Low       := na
+
+if barstate.isconfirmed
+    // ── GATE 1 · FLAG — the ACCUMULATION quarter's FIRST bar (container open) closes beyond the PREVIOUS candle container (killzone checked here only) ──
+    // On this bar containerRolled is true; candleContainer.closed* is the previous container. A flag only — NOT yet the overextension.
+    if cbrEnabled and tradeEntryAllowed() and not cbrTrade.open and cbrFlagPushDir == 0 and cbrSetupDir == 0 and containerRolled and cbrKillzoneOpen and not na(candleContainer.closedHigh)
+        if close > candleContainer.closedHigh
+            cbrFlagPushDir := 1
+            cbrFlagCount   += 1
+            if cbrShowGate1Markers
+                label.new(bar_index, high, "F↑", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_down, color = color.new(cbrGate1MarkerColor, 55), textcolor = color.white, size = size.tiny)
+        else if close < candleContainer.closedLow
+            cbrFlagPushDir := -1
+            cbrFlagCount   += 1
+            if cbrShowGate1Markers
+                label.new(bar_index, low, "F↓", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_up, color = color.new(cbrGate1MarkerColor, 55), textcolor = color.white, size = size.tiny)
+
+    // ── GATE 1 · CONFIRM — the ACCUMULATION quarter as a whole vs the PREVIOUS
+    //    container's CONTINUATION quarter (Q4). Evaluated ONCE, at Q1's close
+    //    (the Q2 open bar): quarterOHLC.closed* IS Q1 and previousClosed* IS the
+    //    prior container's Q4. Same direction as the flag:
+    //      flag up   + Q1 higher high AND higher low than prev Q4 → SHORT
+    //      flag down + Q1 lower low  AND lower high than prev Q4 → LONG
+    //    The G1 FLAG = Q1's push-side extreme. No shift → the flag dies (one-shot).
+    //    ── CBR-L1/S1 staged entry fires HERE, at this bar's close, in the setup direction ──
+    if cbrFlagPushDir != 0 and cbrSetupDir == 0 and quarterRolled and quarterIndex == 2 and not na(quarterOHLC.closedHigh) and not na(quarterOHLC.previousClosedHigh)
+        if cbrFlagPushDir == 1 and quarterOHLC.closedHigh > quarterOHLC.previousClosedHigh and quarterOHLC.closedLow > quarterOHLC.previousClosedLow
+            cbrSetupDir  := DIRECTION_SHORT
+            cbrConfirmCount += 1
+            cbrG1Extreme := quarterOHLC.closedHigh
+            if cbrShowGate1Markers
+                label.new(bar_index, quarterOHLC.closedHigh, "G1 ▼ SHORT", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_down, color = cbrGate1MarkerColor, textcolor = color.white, size = size.small)
+            // CBR-S1 · staged entry at the G1 confirm bar (structural level = the
+            // previously closed quarter's (Q1's) HIGH; band-clamped; machine unaffected)
+            if cbrEntryS1 and tradeEntryAllowed() and not cbrTrade.open
+                float cbrL1Stop = tightenedStructuralStop(DIRECTION_SHORT, close, quarterOHLC.closedHigh, cbrStopTightenFraction, cbrMinStopDistance, cbrMaxStopDistance)
+                float cbrL1Risk = cbrL1Stop - close
+                if not na(cbrL1Stop) and cbrL1Risk > 0
+                    cbrEntryPrice  := close
+                    cbrStopPrice   := cbrL1Stop
+                    cbrTargetPrice := close - cbrL1Risk * cbrL1TargetRMultiple
+                    cbrShort       := true
+                    cbrEntryTag    := "S1"
+                else
+                    skipMarker(false, "S1")
+        else if cbrFlagPushDir == -1 and quarterOHLC.closedLow < quarterOHLC.previousClosedLow and quarterOHLC.closedHigh < quarterOHLC.previousClosedHigh
+            cbrSetupDir  := DIRECTION_LONG
+            cbrConfirmCount += 1
+            cbrG1Extreme := quarterOHLC.closedLow
+            if cbrShowGate1Markers
+                label.new(bar_index, quarterOHLC.closedLow, "G1 ▲ LONG", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_up, color = cbrGate1MarkerColor, textcolor = color.white, size = size.small)
+            // CBR-L1 · staged entry at the G1 confirm bar (mirror — structural level = Q1's LOW, band-clamped)
+            if cbrEntryL1 and tradeEntryAllowed() and not cbrTrade.open
+                float cbrL1Stop = tightenedStructuralStop(DIRECTION_LONG, close, quarterOHLC.closedLow, cbrStopTightenFraction, cbrMinStopDistance, cbrMaxStopDistance)
+                float cbrL1Risk = close - cbrL1Stop
+                if not na(cbrL1Stop) and cbrL1Risk > 0
+                    cbrEntryPrice  := close
+                    cbrStopPrice   := cbrL1Stop
+                    cbrTargetPrice := close + cbrL1Risk * cbrL1TargetRMultiple
+                    cbrLong        := true
+                    cbrEntryTag    := "L1"
+                else
+                    skipMarker(true, "L1")
+        cbrFlagPushDir := 0
+
+    // ── Q2 EXTREME TRACKER — records which bar makes the OPPOSITE-side extreme (the G3 flag / marker anchor) ──
+    if cbrSetupDir != 0 and quarterIndex == 2
+        if cbrSetupDir == DIRECTION_SHORT and (na(cbrQ2Extreme) or low < cbrQ2Extreme)
+            cbrQ2Extreme    := low
+            cbrQ2ExtremeBar := bar_index
+        else if cbrSetupDir == DIRECTION_LONG and (na(cbrQ2Extreme) or high > cbrQ2Extreme)
+            cbrQ2Extreme    := high
+            cbrQ2ExtremeBar := bar_index
+
+    // ── Q3-ALIVE COUNTER — the setup survived Q2 into the entry window ──
+    if cbrSetupDir != 0 and quarterRolled and quarterIndex == 3
+        cbrQ3AliveCount += 1
+
+    // ── G3 DEBUG MARKER — printed ONCE at the distribution quarter's open (Q2 just
+    //    closed, so the G3 flag is fixed) for EVERY live setup, fire or no fire ──
+    if cbrSetupDir != 0 and quarterRolled and quarterIndex == 3 and cbrShowManipulationWick and not na(quarterOHLC.closedHigh)
+        float cbrG3Level = cbrSetupDir == DIRECTION_SHORT ? quarterOHLC.closedLow : quarterOHLC.closedHigh
+        label.new(na(cbrQ2ExtremeBar) ? bar_index - 1 : cbrQ2ExtremeBar, cbrG3Level, "G3", xloc = xloc.bar_index, yloc = yloc.price, style = cbrSetupDir == DIRECTION_SHORT ? label.style_label_up : label.style_label_down, color = color.new(cbrWickMarkerColor, 40), textcolor = color.white, size = size.tiny)
+
+    // ── Q3 RUNNING EXTREME — updated first so THIS bar is included in the read ──
+    if cbrSetupDir != 0 and quarterIndex == 3
+        cbrQ3High := na(cbrQ3High) ? high : math.max(cbrQ3High, high)
+        cbrQ3Low  := na(cbrQ3Low)  ? low  : math.min(cbrQ3Low,  low)
+
+    // ── L2 · GATE 2 · ENTRY WICK (Q3) + GATE 3 · LOOKBACK VALIDATION — fire at the wick bar's close ──
+    // Mitigated entry: the G3 origin (fixed at Q2's close) is mitigated FIRST,
+    // then the G2 wick fires — the higher-conviction sequence. On any Q3 bar,
+    // quarterOHLC.closed* IS the manipulation quarter (the candle Gate 3 reads).
+    if cbrEnabled and (cbrSetupDir == DIRECTION_LONG ? cbrEntryL2 : cbrEntryS2) and tradeEntryAllowed() and not cbrTrade.open and cbrSetupDir != 0 and quarterIndex == 3 and (high - low) > 0 and not na(quarterOHLC.closedHigh)
+        // GATE 2 — the entry wick on THIS bar, same side as the G1 extreme
+        float candleRange  = high - low
+        float lowerWick    = math.min(open, close) - low
+        float upperWick    = high - math.max(open, close)
+        bool  cbrWickShape   = cbrSetupDir == DIRECTION_SHORT ? upperWick / candleRange >= cbrWickRatio : lowerWick / candleRange >= cbrWickRatio
+        // the wick must BE the distribution quarter's extreme so far — the highest
+        // high (SHORT) / lowest low (LONG) since Q3's first bar. While the extreme
+        // keeps extending, earlier wicks are skipped and the entry waits.
+        bool  cbrQ3ExtremeOk = cbrSetupDir == DIRECTION_SHORT ? high >= cbrQ3High : low <= cbrQ3Low
+        // configurable wait — the wick can only fire once this many Q3 bars have
+        // passed (quarterOHLC.startBar = the forming quarter's first bar).
+        bool  cbrQ3WaitOk    = bar_index - quarterOHLC.startBar >= cbrEntryWaitBars
+        bool  cbrEntryWick   = cbrWickShape and cbrQ3ExtremeOk and cbrQ3WaitOk
+        // GATE 3 — lookback to the closed manipulation quarter (flags all on the push side):
+        //   G1 flag = the G1 confirm candle's extreme · G3 flag = Q2's wicked extreme · G2 flag = THIS bar's wick extreme
+        float cbrG1Flag   = cbrG1Extreme
+        //   G3 flag = the manipulation quarter's extreme OPPOSITE to G1 (the origin of
+        //   the manipulated move): Q2 LOW for SHORT / Q2 HIGH for LONG — a WICK touch.
+        float cbrG3Flag   = cbrSetupDir == DIRECTION_SHORT ? quarterOHLC.closedLow : quarterOHLC.closedHigh
+        bool  cbrG3WickOk = cbrSetupDir == DIRECTION_SHORT ? quarterOHLC.closedLow < math.min(quarterOHLC.closedOpen, quarterOHLC.closedClose) : quarterOHLC.closedHigh > math.max(quarterOHLC.closedOpen, quarterOHLC.closedClose)
+        float cbrG2Flag   = cbrSetupDir == DIRECTION_SHORT ? high : low
+        //   D1 = G1→G3, the FULL manipulated move (origin to push extreme; > 0 by
+        //   construction since the G1 candle is part of Q2).
+        //   D3 = G3→G2, the entry wick's distance from the origin.
+        //   VALID when the wick has retraced at least 50% of D1 — the G2 flag at/past
+        //   the midline of G1→G3, i.e. D3 ≤ 50% of D1.
+        float cbrD1 = cbrSetupDir == DIRECTION_SHORT ? cbrG1Flag - cbrG3Flag : cbrG3Flag - cbrG1Flag
+        float cbrD3 = cbrSetupDir == DIRECTION_SHORT ? cbrG2Flag - cbrG3Flag : cbrG3Flag - cbrG2Flag
+        bool  cbrReversalOk = cbrD3 <= 0.5 * cbrD1
+        if cbrEntryWick and cbrG3WickOk and cbrReversalOk
+            if cbrShowManipulationWick
+                label.new(bar_index, cbrG2Flag, "G2 ↯", xloc = xloc.bar_index, yloc = yloc.price, style = cbrSetupDir == DIRECTION_SHORT ? label.style_label_down : label.style_label_up, color = cbrWickMarkerColor, textcolor = color.white, size = size.tiny)
+            // STOP — same methodology as L1/S1: measure close → the previously
+            // CLOSED quarter's (Q2's) relevant extreme (high for SHORT / low for
+            // LONG), place the stop at the tighten % of that distance, band-clamped.
+            float cbrStructuralLevel = cbrSetupDir == DIRECTION_SHORT ? quarterOHLC.closedHigh : quarterOHLC.closedLow
+            float cbrStopLevel    = tightenedStructuralStop(cbrSetupDir, close, cbrStructuralLevel, cbrStopTightenFraction, cbrMinStopDistance, cbrMaxStopDistance)
+            float cbrRiskDistance = cbrSetupDir == DIRECTION_LONG ? close - cbrStopLevel : cbrStopLevel - close
+            bool  cbrEntryValid   = not na(cbrStopLevel) and cbrRiskDistance > 0
+            if cbrEntryValid
+                cbrEntryPrice  := close
+                cbrStopPrice   := cbrStopLevel
+                cbrTargetPrice := cbrSetupDir == DIRECTION_LONG ? close + cbrRiskDistance * cbrL2TargetRMultiple : close - cbrRiskDistance * cbrL2TargetRMultiple
+                cbrLong  := cbrSetupDir == DIRECTION_LONG
+                cbrShort := cbrSetupDir == DIRECTION_SHORT
+                cbrEntryTag    := cbrSetupDir == DIRECTION_LONG ? "L2" : "S2"
+                cbrL2FireCount += 1
+            else
+                skipMarker(cbrSetupDir == DIRECTION_LONG, cbrSetupDir == DIRECTION_LONG ? "L2" : "S2")
+            cbrSetupDir  := 0
+            cbrG1Extreme := na
+            cbrQ2Extreme := na
+            cbrQ2ExtremeBar := na
+            cbrQ3High    := na
+            cbrQ3Low     := na
+
+    // ── DEATH — the entry window (distribution quarter) has passed ──
+    if cbrSetupDir != 0 and quarterIndex == 4
+        cbrSetupDir  := 0
+        cbrG1Extreme := na
+        cbrQ2Extreme := na
+        cbrQ2ExtremeBar := na
+        cbrQ3High    := na
+        cbrQ3Low     := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILL — open the trade from the fired signal (any entry mode)
+// ═══════════════════════════════════════════════════════════════════════════
+if (cbrLong or cbrShort) and not cbrTrade.open
+    cbrTrade.direction   := cbrLong ? DIRECTION_LONG : DIRECTION_SHORT
+    cbrTrade.entryPrice  := cbrEntryPrice
+    cbrTrade.stopPrice   := cbrStopPrice
+    cbrTrade.targetPrice := cbrTargetPrice
+    cbrTrade.initialRisk := math.abs(cbrEntryPrice - cbrStopPrice)
+    cbrTrade.beArmed     := false
+    cbrTrade.open        := true
+    if showTradeZoneBoxes
+        cbrTrade.stopBox   := cbrLong ? zoneBox(cbrEntryPrice, cbrStopPrice, color.red) : zoneBox(cbrStopPrice, cbrEntryPrice, color.red)
+        cbrTrade.targetBox := cbrLong ? zoneBox(cbrTargetPrice, cbrEntryPrice, color.green) : zoneBox(cbrEntryPrice, cbrTargetPrice, color.green)
+
+// ═══ SIGNAL MARKERS ══════════════════════════════════════════════════════════
+plotshape(cbrLong,  "CBR Long",  style = shape.triangleup,   location = location.belowbar, color = cbrSignalColor, size = size.small, text = "L (CBR)", textcolor = color.white)
+plotshape(cbrShort, "CBR Short", style = shape.triangledown, location = location.abovebar, color = cbrSignalColor, size = size.small, text = "S (CBR)", textcolor = color.white)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FA_2: F2 STRATEGY — gate framework v2
+// ───────────────────────────────────────────────────────────────────────────
+//   GATE 1 · EXPANSION  (HTF · candle container)
+//       The just-closed container swept BOTH sides of the prior container
+//       (expansion / volume). The container's final-bar close sets the bias:
+//         Bullish Expansion (close above prior body) → LONG
+//         Bearish Expansion (close below prior body) → SHORT
+//       Arms the NEXT container only. An unused arm expires when that
+//       container ends; a fresh expansion supersedes a pending arm.
+//   GATE 2 · SETUP      (MTF · failed-2 quarter) — KILLZONE CHECKED HERE ONLY
+//       ANY quarter of the armed container qualifies, but a failed-2 arms the
+//       trigger only while the shared per-asset killzone is open. Evaluated
+//       ONLY when a quarter completes (the 15m boundary) — never intrabar.
+//       Must agree with the Gate 1 bias:
+//         LONG  → quarter swept the prior quarter's LOW,  closed back at/above it
+//         SHORT → quarter swept the prior quarter's HIGH, closed back at/below it
+//   GATE 3 · ENTRY TRIGGER (LTF · MSB within a wait window)
+//       Once a failed-2 arms, the entry waits up to f2MsbWaitBars for a fresh
+//       structure break in the bias direction (the same bar counts, but is
+//       not required). The window survives the container roll, so a failed-2
+//       late in the container still gets its full wait. MSB inside the window →
+//       fire at that bar's close. Window elapses → the trigger is dropped;
+//       a later failed-2 in the armed container can re-arm. No FVG.
+//   ENTRY — the close of the MSB bar.
+//   STOP  — CBR-L1 structural methodology: measure the entry bar's close to
+//       the previously CLOSED quarter's relevant extreme (low for LONG / high
+//       for SHORT), tighten to F2's per-asset stop-tighten %, then
+//       band-clamped (min widen / max skip); target = fixed R off the stop
+//       distance, computed inline (no resolveEntry).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══ FILTERS ═════════════════════════════════════════════════════════════════
+// Shared per-asset killzone (same config CBR reads) — checked at Gate 2 only:
+// a failed-2 arms the trigger ONLY while the killzone is open. The MSB wait may
+// complete just past the zone edge, mirroring how a CBR setup finishes its run.
+bool f2KillzoneOpen = not killzoneConfig.restrictEnabled or ammo.isKillzoneOpen(killzoneConfig.activeHours, hourLocal, quarterIndex)
+
+// ═══ SETUP STATE ═════════════════════════════════════════════════════════════
+// The hour/quarter grid, OHLC and roll events all come from the SHARED period
+// engine (candleContainer / quarterOHLC / containerRolled / quarterRolled) and
+// the shared sequence counters — F2 defines nothing of its own here.
+var int f2SetupDir          = DIRECTION_NONE
+var int f2ArmedContainerSeq = na
+
+// ═══ GATE 1 — EXPANSION → arm the NEXT container ═════════════════════════════
+if containerRolled and not na(candleContainer.previousClosedOpen)
+    bool f2ExpansionSweep   = candleContainer.closedHigh > candleContainer.previousClosedHigh and candleContainer.closedLow < candleContainer.previousClosedLow
+    bool f2BullishExpansion = f2ExpansionSweep and candleContainer.closedClose > math.max(candleContainer.previousClosedOpen, candleContainer.previousClosedClose)
+    bool f2BearishExpansion = f2ExpansionSweep and candleContainer.closedClose < math.min(candleContainer.previousClosedOpen, candleContainer.previousClosedClose)
+    if f2Enabled and (f2BullishExpansion or f2BearishExpansion)
+        f2SetupDir          := f2BullishExpansion ? DIRECTION_LONG : DIRECTION_SHORT
+        f2ArmedContainerSeq := containerSequence          // the container that just OPENED is the hunting ground
+    if f2ShowContainerShade and (f2BullishExpansion or f2BearishExpansion)
+        box.new(candleContainer.startBar - 1, candleContainer.closedHigh, bar_index - 1, candleContainer.closedLow, xloc = xloc.bar_index, bgcolor = f2BullishExpansion ? f2ContainerBullishShade : f2ContainerBearishShade, border_color = color.new(f2BullishExpansion ? f2ContainerBullishShade : f2ContainerBearishShade, 0))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPEN-TRADE MANAGEMENT — runs every bar (independent of the setup sequence)
+// ═══════════════════════════════════════════════════════════════════════════
+var int   f2WinCount       = 0
+var int   f2LossCount      = 0
+var int   f2BreakevenCount = 0
+var float f2NetRMultiple   = 0.0
+[f2StillOpen, f2RealisedR] = resolveStrategyTrade(f2Trade)
+f2Trade.open := f2StillOpen
+if not na(f2RealisedR)
+    f2WinCount       += f2RealisedR > 0 ? 1 : 0
+    f2LossCount      += f2RealisedR < 0 ? 1 : 0
+    f2BreakevenCount += f2RealisedR == 0 ? 1 : 0
+    f2NetRMultiple   += f2RealisedR
+if f2Trade.open and not na(f2Trade.stopBox)
+    box.set_right(f2Trade.stopBox, time)
+    box.set_right(f2Trade.targetBox, time)
+
+// ═══ TRIGGER STATE — the armed failed-2 (Gate 2 output) ══════════════════════
+// Set when a failed-2 quarter closes (the latest failed-2 supersedes). The
+// trigger carries its own direction + bar so its MSB wait window can outlive
+// the container arm (a failed-2 late in the hour still gets its full wait).
+// f2FailedExtreme marks the swept level (chart marker); the STOP itself is the
+// CBR-L1 structural stop, derived at the entry bar.
+var int   f2TriggerDir    = DIRECTION_NONE
+var float f2FailedExtreme = na
+var int   f2FailedBar     = na
+
+// signals produced by the fire stage (consumed by FILL below)
+bool  f2Long  = false
+bool  f2Short = false
+float f2EntryPrice  = na
+float f2StopPrice   = na
+float f2TargetPrice = na
+
+// global lock drops a developing setup (every bar)
+if blockNewEntriesWhileTradeOpen and anyTradeOpen() and not f2Trade.open and (f2SetupDir != DIRECTION_NONE or f2TriggerDir != DIRECTION_NONE)
+    f2SetupDir          := DIRECTION_NONE
+    f2ArmedContainerSeq := na
+    f2TriggerDir        := DIRECTION_NONE
+    f2FailedExtreme     := na
+    f2FailedBar         := na
+
+if barstate.isconfirmed
+    // ── GATE 2 — failed-2 at a quarter close within the armed container → arm the trigger ──
+    // containerSequence[1] scopes the closed quarter to the armed container, which
+    // also makes its final quarter (whose close coincides with the container roll)
+    // eligible before the expiry below fires.
+    bool f2ClosedQuarterInArmedContainer = quarterRolled and not na(f2ArmedContainerSeq) and containerSequence[1] == f2ArmedContainerSeq
+    if f2Enabled and f2KillzoneOpen and f2SetupDir != DIRECTION_NONE and f2ClosedQuarterInArmedContainer and not na(quarterOHLC.previousClosedHigh)
+        bool failedDown = quarterOHLC.closedLow  < quarterOHLC.previousClosedLow  and quarterOHLC.closedClose >= quarterOHLC.previousClosedLow  and quarterOHLC.closedHigh <= quarterOHLC.previousClosedHigh
+        bool failedUp   = quarterOHLC.closedHigh > quarterOHLC.previousClosedHigh and quarterOHLC.closedClose <= quarterOHLC.previousClosedHigh and quarterOHLC.closedLow  >= quarterOHLC.previousClosedLow
+        bool failedHit  = (f2SetupDir == DIRECTION_LONG and failedDown) or (f2SetupDir == DIRECTION_SHORT and failedUp)
+        if failedHit
+            // arm the trigger: direction + the swept extreme (chart marker) + this bar
+            f2TriggerDir    := f2SetupDir
+            f2FailedExtreme := f2SetupDir == DIRECTION_LONG ? quarterOHLC.closedLow : quarterOHLC.closedHigh
+            f2FailedBar     := bar_index
+            if f2ShowFailedQuarterMarker
+                label.new(bar_index, f2FailedExtreme, "F2", xloc = xloc.bar_index, yloc = yloc.price, style = f2SetupDir == DIRECTION_LONG ? label.style_label_up : label.style_label_down, color = f2FailedQuarterMarkerColor, textcolor = color.white, size = size.tiny)
+
+    // ── GATE 3 / ENTRY — a fresh MSB inside the wait window fires the trade ──
+    // Runs AFTER Gate 2 in the same block (a same-bar MSB counts as bar 0 of
+    // the window). The trigger runs on ITS OWN direction/bar, so the wait
+    // survives the container roll. Stop = the CBR-L1 structural methodology at
+    // the entry bar (close → previously closed quarter's extreme, tightened,
+    // band-clamped), fixed-R target inline off the stop distance.
+    if f2Enabled and tradeEntryAllowed() and not f2Trade.open and f2TriggerDir != DIRECTION_NONE
+        bool f2MsbHit = f2TriggerDir == DIRECTION_LONG ? structureBreakBull : structureBreakBear
+        if f2MsbHit
+            // structural level = the previously CLOSED quarter's relevant extreme
+            float f2StructuralLevel = f2TriggerDir == DIRECTION_LONG ? quarterOHLC.closedLow : quarterOHLC.closedHigh
+            float f2StopLevel       = tightenedStructuralStop(f2TriggerDir, close, f2StructuralLevel, f2StopTightenFraction, f2MinStopDistance, f2MaxStopDistance)
+            float f2RiskDistance    = f2TriggerDir == DIRECTION_LONG ? close - f2StopLevel : f2StopLevel - close
+            bool  f2EntryValid      = not na(f2StopLevel) and f2RiskDistance > 0
+            if f2EntryValid
+                f2EntryPrice  := close
+                f2StopPrice   := f2StopLevel
+                f2TargetPrice := f2TriggerDir == DIRECTION_LONG ? close + f2RiskDistance * f2TargetRMultiple : close - f2RiskDistance * f2TargetRMultiple
+                f2Long  := f2TriggerDir == DIRECTION_LONG
+                f2Short := f2TriggerDir == DIRECTION_SHORT
+            else
+                skipMarker(f2TriggerDir == DIRECTION_LONG, "F2")
+            f2SetupDir          := DIRECTION_NONE
+            f2ArmedContainerSeq := na
+            f2TriggerDir        := DIRECTION_NONE
+            f2FailedExtreme     := na
+            f2FailedBar         := na
+        else if not na(f2FailedBar) and bar_index - f2FailedBar > f2MsbWaitBars
+            // wait window elapsed with no MSB → drop the trigger only; the
+            // container arm (if still live) can re-arm on a later failed-2
+            f2TriggerDir    := DIRECTION_NONE
+            f2FailedExtreme := na
+            f2FailedBar     := na
+
+    // ── EXPIRY — the armed container has fully passed: clear the ARM only ──
+    // A pending trigger keeps its MSB wait window (it carries its own direction
+    // and bar). A same-bar re-arm from a fresh expansion keeps the seq current.
+    if f2SetupDir != DIRECTION_NONE and not na(f2ArmedContainerSeq) and containerSequence != f2ArmedContainerSeq
+        f2SetupDir          := DIRECTION_NONE
+        f2ArmedContainerSeq := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILL — open the trade from a fired signal
+// ═══════════════════════════════════════════════════════════════════════════
+if (f2Long or f2Short) and not f2Trade.open
+    f2Trade.direction   := f2Long ? DIRECTION_LONG : DIRECTION_SHORT
+    f2Trade.entryPrice  := f2EntryPrice
+    f2Trade.stopPrice   := f2StopPrice
+    f2Trade.targetPrice := f2TargetPrice
+    f2Trade.initialRisk := math.abs(f2EntryPrice - f2StopPrice)
+    f2Trade.beArmed     := false
+    f2Trade.open        := true
+    if showTradeZoneBoxes
+        f2Trade.stopBox   := f2Long ? zoneBox(f2EntryPrice, f2StopPrice, color.red) : zoneBox(f2StopPrice, f2EntryPrice, color.red)
+        f2Trade.targetBox := f2Long ? zoneBox(f2TargetPrice, f2EntryPrice, color.green) : zoneBox(f2EntryPrice, f2TargetPrice, color.green)
+
+// ═══ SIGNAL MARKERS ══════════════════════════════════════════════════════════
+plotshape(f2Long,  "F2 Long",  style = shape.triangleup,   location = location.belowbar, color = f2SignalColor, size = size.small, text = "LONG",  textcolor = color.white)
+plotshape(f2Short, "F2 Short", style = shape.triangledown, location = location.abovebar, color = f2SignalColor, size = size.small, text = "SHORT", textcolor = color.white)
+
+
+// ═══ LAST-SIGNAL TRACKING ════════════════════════════════════════════════════
+var int   cbrLastDirection = 0
+var float cbrLastPrice     = na
+var int   cbrLastTime      = na
+var int   f2LastDirection  = 0
+var float f2LastPrice      = na
+var int   f2LastTime       = na
+if cbrLong or cbrShort
+    cbrLastDirection := cbrLong ? DIRECTION_LONG : DIRECTION_SHORT
+    cbrLastPrice     := cbrEntryPrice
+    cbrLastTime      := time
+if f2Long or f2Short
+    f2LastDirection := f2Long ? DIRECTION_LONG : DIRECTION_SHORT
+    f2LastPrice     := f2EntryPrice
+    f2LastTime      := time
+
+formatLastSignal(int signalDirection, float signalPrice, int signalTime) =>
+    signalDirection == 0 or na(signalTime) ? "—" : (signalDirection == DIRECTION_LONG ? "LONG " : "SHORT ") + str.tostring(signalPrice, format.mintick) + " @ " + str.format_time(signalTime, "MMM-dd HH:mm", anchorTimezone)
+
+// ═══ STATS TABLE ═════════════════════════════════════════════════════════════
+var table statsTable = table.new(position.bottom_right, 2, 12, border_width = 1)
+statsRow(int rowIndex, string rowLabel, string rowValue, color valueColor) =>
+    table.cell(statsTable, 0, rowIndex, rowLabel, text_color = color.white, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_left)
+    table.cell(statsTable, 1, rowIndex, rowValue, text_color = valueColor, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_right)
+if showStatsTable and barstate.islast
+    color headerBackground = color.new(#1a237e, 20)
+    color profitColor      = color.new(#00e676, 0)
+    color highlightColor   = color.new(#ffeb3b, 0)
+    int   totalWins       = cbrWinCount + f2WinCount
+    int   totalLosses     = cbrLossCount + f2LossCount
+    int   totalBreakevens = cbrBreakevenCount + f2BreakevenCount
+    int   totalTrades     = totalWins + totalLosses + totalBreakevens
+    int   decisiveTrades  = totalWins + totalLosses
+    float winRate         = decisiveTrades > 0 ? totalWins * 100.0 / decisiveTrades : 0.0
+    float netRMultiple    = cbrNetRMultiple + f2NetRMultiple
+    float profitDollars   = netRMultiple * riskDollarsPerR
+    table.cell(statsTable, 0, 0, "SNIPER_BRAVO — Stats", text_color = color.white, bgcolor = headerBackground, text_halign = text.align_left)
+    table.cell(statsTable, 1, 0, "", bgcolor = headerBackground)
+    statsRow(1,  "Total Trades", str.tostring(totalTrades), color.white)
+    statsRow(2,  "W / L / BE", str.tostring(totalWins) + " / " + str.tostring(totalLosses) + " / " + str.tostring(totalBreakevens), color.white)
+    statsRow(3,  "Win Rate (ex-BE)", str.tostring(winRate, "#.##") + "%", highlightColor)
+    statsRow(4,  "CBR W/L/BE", str.tostring(cbrWinCount) + " / " + str.tostring(cbrLossCount) + " / " + str.tostring(cbrBreakevenCount), color.white)
+    statsRow(5,  "F2 W/L/BE",  str.tostring(f2WinCount)  + " / " + str.tostring(f2LossCount)  + " / " + str.tostring(f2BreakevenCount),  color.white)
+    statsRow(6,  "Profit ($ / R)", "$" + str.tostring(profitDollars, "#.##") + "  (" + str.tostring(netRMultiple, "#.#") + "R)", profitColor)
+    statsRow(7,  "Killzone", killzoneWindowName, color.white)
+    color lockColor = anyTradeOpen() ? color.new(#ff5252, 0) : color.new(#00e676, 0)
+    statsRow(8,  "Trade Lock", blockNewEntriesWhileTradeOpen ? (anyTradeOpen() ? "LOCKED" : "CLEAR") : "OFF", lockColor)
+    statsRow(9,  "Active OBs", str.tostring(structureState.internalOrderBlocks.size()), color.white)
+    statsRow(10, "BE @ 0.5R", moveStopToBreakeven ? "ON" : "OFF", moveStopToBreakeven ? color.new(#00e676, 0) : color.gray)
+    statsRow(11, "CBR L2 funnel F→G1→Q3→fire", str.tostring(cbrFlagCount) + " → " + str.tostring(cbrConfirmCount) + " → " + str.tostring(cbrQ3AliveCount) + " → " + str.tostring(cbrL2FireCount), color.new(#4dd0e1, 0))
+
+// ═══ UNIFIED DASHBOARD ═══════════════════════════════════════════════════════
+var table dashboardTable = table.new(position.top_right, 2, 6,
+     bgcolor = color.new(#1e222d, 0), border_color = #373a46, border_width = 1, frame_color = #373a46, frame_width = 1)
+dashboardRow(int rowIndex, string rowLabel, string rowValue, color valueColor) =>
+    table.cell(dashboardTable, 0, rowIndex, rowLabel, text_color = color.white, text_size = size.small, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_left)
+    table.cell(dashboardTable, 1, rowIndex, rowValue, text_color = valueColor, text_size = size.small, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_right)
+if showUnifiedDashboard and barstate.islast
+    table.cell(dashboardTable, 0, 0, "SNIPER_BRAVO — Panel", text_color = color.white, text_size = size.small, bgcolor = color.new(#1a237e, 20), text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Active", text_color = color.white, text_size = size.small, bgcolor = color.new(#1a237e, 20), text_halign = text.align_right)
+    dashboardRow(1, "Killzone", killzoneWindowName, color.white)
+    dashboardRow(2, "Phase", phaseLetter(quarterIndex), color.white)
+    dashboardRow(3, "Bias", ammo.biasText(biasVerdict.ratifiedBiasId), ammo.biasColor(biasVerdict.ratifiedBiasId))
+    dashboardRow(4, "CBR last", formatLastSignal(cbrLastDirection, cbrLastPrice, cbrLastTime), cbrLastDirection == DIRECTION_LONG ? color.new(#00e676, 0) : cbrLastDirection == DIRECTION_SHORT ? color.new(#f23645, 0) : color.gray)
+    dashboardRow(5, "F2 last", formatLastSignal(f2LastDirection, f2LastPrice, f2LastTime), f2LastDirection == DIRECTION_LONG ? color.new(#00e676, 0) : f2LastDirection == DIRECTION_SHORT ? color.new(#f23645, 0) : color.gray)
+
+// ═══ ALERTS ══════════════════════════════════════════════════════════════════
+// NOTE: alert path is untouched by the breakeven tracker. Payloads fire once at
+// entry with the ORIGINAL entry/SL/TP and read the SIGNAL-BAR LOCALS (v2 fix:
+// never the tracker, which could hold a previous trade's prices when the lock
+// is off); the EA manages stops with its own logic.
+string schemaVersion     = "2.0.0"
+string providerName      = "tradingview"
+string chartType         = "Candle"
+string cbrStrategyId     = "SB-CBR-" + assetConfig.assetCode
+string f2StrategyId      = "SB-F2-"  + assetConfig.assetCode
+string cbrStrategyName   = "SNIPER_BRAVO_CBR"
+string f2StrategyName    = "SNIPER_BRAVO_F2"
+string brokerSymbol      = str.length(brokerSymbolOverride) > 0 ? brokerSymbolOverride : syminfo.ticker
+
+// ── CBR (entryTag distinguishes the entry mode: L1/S1 · L2/S2) ──
+if cbrLong and not na(cbrStopPrice) and not na(cbrTargetPrice)
+    string signalId = cbrStrategyId + "-L-" + cbrEntryTag + "-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, cbrStrategyId, cbrStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "LONG", cbrEntryPrice, cbrStopPrice, cbrTargetPrice, cbrStrategyName + "-ENTRY-" + cbrEntryTag + "-L")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+if cbrShort and not na(cbrStopPrice) and not na(cbrTargetPrice)
+    string signalId = cbrStrategyId + "-S-" + cbrEntryTag + "-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, cbrStrategyId, cbrStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "SHORT", cbrEntryPrice, cbrStopPrice, cbrTargetPrice, cbrStrategyName + "-ENTRY-" + cbrEntryTag + "-S")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+// ── F2 ──
+if f2Long and not na(f2StopPrice) and not na(f2TargetPrice)
+    string signalId = f2StrategyId + "-L-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, f2StrategyId, f2StrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "LONG", f2EntryPrice, f2StopPrice, f2TargetPrice, f2StrategyName + "-ENTRY-L")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+if f2Short and not na(f2StopPrice) and not na(f2TargetPrice)
+    string signalId = f2StrategyId + "-S-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, f2StrategyId, f2StrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "SHORT", f2EntryPrice, f2StopPrice, f2TargetPrice, f2StrategyName + "-ENTRY-S")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)

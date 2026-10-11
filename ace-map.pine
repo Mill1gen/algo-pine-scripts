@@ -1,0 +1,678 @@
+// =============================================================================
+// ACE Macro — the Map (1H logic / 30m publish)   v1.0   (Monday anchor base)
+//   TWO bias layers (kept side by side):
+//     1) HH/HL structural (close-based)        -> "Bias Direction"
+//     2) CBR session EBP-rejection bias        -> "CBR Bias"   (Sydney)
+//        Window: first TWO 1H candles of Asia/London/NY.
+//        Bearish = bearish ENGULFING candle, HIGH into a SUPPLY zone, closes in-band.
+//        Bullish = bullish ENGULFING candle, LOW into a DEMAND zone, closes in-band.
+//        Outside all zones -> nothing. No Range.
+//   (DXY confluence intentionally NOT included.)
+//   Zones — 3 tiers, dynamic extremity assignment + staggered vintage anchor.
+//     Extreme    = MORE extreme of (this wk, last wk)  — flips dynamically
+//     Decisional = the LESS extreme of the two
+//     Previous   = two-weeks-ago level (oldest)
+//   WEEK MATURITY: Monday 08:00 anchor, but the current week is NOT a live tier
+//     until Wed 08:00 Sydney (its range isn't formed yet → would conflate at price).
+//     Before Wed: tiers + P/D + equilibrium key off COMPLETED weeks (last, -2, -3).
+//     After Wed: current week goes live (Ext/Dec flip vs last wk), P/D + EQ switch
+//     to the current week. Zones and P/D switch together at the same moment.
+//   Each box's LEFT edge = start of the week its level came from
+//     → Previous ~3wk back, Extreme/Decisional ~1wk or ~2wk (swap with the flip)
+//   Bias HH/HL (close-based); ER-anchored P/D; ER H/L (+hist); MTF PDH/PDL/PWH/PWL.
+//
+//   v1.0 — COMPASS PUBLISHER
+//     Replaces the old data-window plot block (plots do not transmit — nothing
+//     could read them). Publishes levels, bias and volatility to Compass on
+//     every bar close: no signals, no per-asset config, one script every chart.
+//     Run on 30m. Zones/ER are weekly-derived so they are timeframe-independent;
+//     cbr_bias comes from this chart, so the payload always matches the table.
+//     Compass derives the ratios, the typical session ATR, bias alignment and
+//     the nine zone booleans — this script sends raw state only.
+//     The FRI trade layer has been removed: this is a MAP, not a strategy.
+//     It emits no trade signals and places no orders.
+// =============================================================================
+//@version=5
+indicator("ACE_MAP", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// -----------------------------------------------------------------------------
+// CONSTANTS
+// -----------------------------------------------------------------------------
+BULLISH_LEG = 1
+BEARISH_LEG = 0
+BULLISH     = 1
+BEARISH     = -1
+GREEN = #089981
+RED   = #f23645
+BLUE  = #2157f3
+GRAY  = #878b94
+TZ    = "Australia/Sydney"
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+gSwing = "Bias / Structure"
+swingLen = input.int(50, "Swing detection length", minval = 10, group = gSwing)
+showBOS  = input.bool(true, "Show BOS / CHoCH labels", group = gSwing)
+
+gZones = "Zones (3 tiers, dynamic extremity)"
+atrLen   = input.int(24, "ATR length", minval = 1, group = gZones)
+extMult  = input.float(0.5, "Extreme zone ATR mult",    minval = 0.1, group = gZones)
+decMult  = input.float(1.0, "Decisional zone ATR mult", minval = 0.1, group = gZones)
+prvMult  = input.float(1.5, "Previous zone ATR mult",   minval = 0.1, group = gZones)
+dimCounter = input.bool(false, "Dim countertrend zones (vs bias)", group = gZones)
+
+gPD = "Premium / Discount (on ER weekly range)"
+showPD = input.bool(true, "Show Premium/Discount/Mid", group = gPD)
+
+gER = "Weekly External Range (Mon 0800 Sydney)"
+showER  = input.bool(true, "Show ER High/Low", group = gER)
+erWeeks = input.int(3, "Weeks of history", minval = 1, maxval = 20, group = gER)
+
+gMTF = "MTF Levels"
+showPD_D = input.bool(true, "Previous Day H/L (PDH/PDL)",  group = gMTF)
+showPW_W = input.bool(true, "Previous Week H/L (PWH/PWL)", group = gMTF)
+
+gDash = "Dashboard"
+showDash = input.bool(true, "Show bias dashboard", group = gDash)
+
+gCBR = "CBR Session Bias (toggleable)"
+showCBRBias    = input.bool(true,  "Show CBR bias signals", group = gCBR)
+useEngulf      = input.bool(false, "Require prior-candle engulfing (EBP on previous 1H candle)", group = gCBR)
+useTwoCandle   = input.bool(true,  "Two-candle window  — off = first session candle only", group = gCBR)
+useWeekWindow  = input.bool(true,  "Restrict to Tue 00:00 -> Fri 15:00", group = gCBR)
+useCloseInBand = input.bool(false, "Also require CLOSE inside the box  — off = wick-entry only", group = gCBR)
+markerAtClose  = input.bool(false, "Marker at close  — off = above/below bar", group = gCBR)
+hrAsia = input.int(9,  "Asia first candle hour (Sydney)",   minval = 0, maxval = 23, group = gCBR)
+hrLon  = input.int(15, "London candle hour (Sydney)", minval = 0, maxval = 23, group = gCBR)
+hrNY   = input.int(0,  "NY candle hour (Sydney)",     minval = 0, maxval = 23, group = gCBR)
+
+// ── Compass Publisher ──
+gCompass = "Compass Publisher"
+compassEnabled = input.bool(true, "Publish to Compass", group = gCompass,
+     tooltip = "Sends levels, bias and volatility to Compass on every bar close. No signals. Run this chart on 30m.")
+compassSecret  = input.string("change-me", "Webhook secret", group = gCompass,
+     tooltip = "Must match WEBHOOK_SECRET in Compass's .env. TradingView cannot send custom headers, so it travels in the body.")
+
+// -----------------------------------------------------------------------------
+// TYPE
+// -----------------------------------------------------------------------------
+type pivot
+    float currentLevel
+    float lastLevel
+    bool  crossed
+
+// -----------------------------------------------------------------------------
+// BIAS ENGINE — swing pivots, HH/HL, flip on close
+// -----------------------------------------------------------------------------
+var pivot swingHigh = pivot.new(na, na, false)
+var pivot swingLow  = pivot.new(na, na, false)
+var int   bias = 0
+
+leg(int size) =>
+    var int lg = 0
+    bool newHigh = high[size] > ta.highest(size)
+    bool newLow  = low[size]  < ta.lowest(size)
+    if newHigh
+        lg := BEARISH_LEG
+    else if newLow
+        lg := BULLISH_LEG
+    lg
+
+startOfNewLeg(int lg)     => ta.change(lg) != 0
+startOfBullishLeg(int lg) => ta.change(lg) == +1
+higherTF(string tf) => timeframe.in_seconds() > timeframe.in_seconds(tf)
+
+int  lg2    = leg(swingLen)
+bool isNew  = startOfNewLeg(lg2)
+bool isBull = startOfBullishLeg(lg2)
+if isNew
+    if isBull
+        swingLow.lastLevel    := swingLow.currentLevel
+        swingLow.currentLevel := low[swingLen]
+        swingLow.crossed      := false
+    else
+        swingHigh.lastLevel    := swingHigh.currentLevel
+        swingHigh.currentLevel := high[swingLen]
+        swingHigh.crossed      := false
+
+biasBreakUp   = ta.crossover(close, swingHigh.currentLevel) and not swingHigh.crossed
+biasBreakDown = ta.crossunder(close, swingLow.currentLevel) and not swingLow.crossed
+
+if biasBreakUp
+    isChoCh = bias <= 0
+    swingHigh.crossed := true
+    bias := BULLISH
+    if showBOS
+        label.new(bar_index, swingHigh.currentLevel, isChoCh ? "CHoCH" : "BOS", color = color(na), textcolor = GREEN, style = label.style_label_down, size = size.tiny)
+if biasBreakDown
+    isChoCh = bias >= 0
+    swingLow.crossed := true
+    bias := BEARISH
+    if showBOS
+        label.new(bar_index, swingLow.currentLevel, isChoCh ? "CHoCH" : "BOS", color = color(na), textcolor = RED, style = label.style_label_up, size = size.tiny)
+
+biasBull = bias > 0
+biasBear = bias < 0
+
+atrVal   = ta.atr(atrLen)
+extZONE  = atrVal * extMult
+decZONE  = atrVal * decMult
+prvZONE  = atrVal * prvMult
+
+// -----------------------------------------------------------------------------
+// WEEKLY EXTERNAL RANGE + chained snapshots (this / prev / prev-prev week)
+//   H/L chain:        erH  -> pwH -> ppH
+//   start-bar chain:  erStartBar -> prevStartBar -> prevPrevStartBar
+// -----------------------------------------------------------------------------
+erSession = "0800-0800:23456"
+inER    = not na(time("", erSession, TZ))
+erStart = inER and not inER[1]
+erEnd   = not inER and inER[1]
+
+var float erH = na
+var float erL = na
+var int   erStartBar = na
+var int   prevStartBar = na
+var int   prevPrevStartBar = na
+var float pwH = na
+var float pwL = na
+var float ppH = na
+var float ppL = na
+var float pppH = na
+var float pppL = na
+var int   prevPrevPrevStartBar = na
+
+if erStart
+    if not na(ppH)
+        pppH := ppH
+        pppL := ppL
+    if not na(pwH)
+        ppH := pwH
+        ppL := pwL
+    if not na(erH)
+        pwH := erH
+        pwL := erL
+    prevPrevPrevStartBar := prevPrevStartBar
+    prevPrevStartBar := prevStartBar
+    prevStartBar := erStartBar
+    erH := high
+    erL := low
+    erStartBar := bar_index
+if inER
+    erH := math.max(erH, high)
+    erL := math.min(erL, low)
+
+// week maturity — the current week's H/L only become a live tier from Wed 08:00
+// Sydney. Before that, tiers + P/D key off COMPLETED weeks (no unformed range).
+var bool weekMature = false
+if erStart
+    weekMature := false
+mDow = dayofweek(time, TZ)
+if (mDow == dayofweek.wednesday and hour(time, TZ) >= 8) or mDow == dayofweek.thursday or mDow == dayofweek.friday
+    weekMature := true
+
+// -----------------------------------------------------------------------------
+// ZONE TIER ASSIGNMENT — dynamic extremity (recomputed each bar)
+//   Supply: more extreme = HIGHER high.   Demand: more extreme = LOWER low.
+//   Each tier carries (level, source-week start bar) for staggered anchoring.
+// -----------------------------------------------------------------------------
+float extSupL = na
+int   extSupB = na
+float decSupL = na
+int   decSupB = na
+float prvSupL = na
+int   prvSupB = na
+if weekMature and not na(erH)
+    // current week live: dynamic extremity flip between this week and last week
+    if na(pwH) or erH >= pwH
+        extSupL := erH
+        extSupB := erStartBar
+        decSupL := pwH
+        decSupB := prevStartBar
+    else
+        extSupL := pwH
+        extSupB := prevStartBar
+        decSupL := erH
+        decSupB := erStartBar
+    prvSupL := ppH
+    prvSupB := prevPrevStartBar
+else
+    // immature: completed weeks only — last, 2-ago, 3-ago (no unformed current week)
+    extSupL := pwH
+    extSupB := prevStartBar
+    decSupL := ppH
+    decSupB := prevPrevStartBar
+    prvSupL := pppH
+    prvSupB := prevPrevPrevStartBar
+
+float extDemL = na
+int   extDemB = na
+float decDemL = na
+int   decDemB = na
+float prvDemL = na
+int   prvDemB = na
+if weekMature and not na(erL)
+    if na(pwL) or erL <= pwL
+        extDemL := erL
+        extDemB := erStartBar
+        decDemL := pwL
+        decDemB := prevStartBar
+    else
+        extDemL := pwL
+        extDemB := prevStartBar
+        decDemL := erL
+        decDemB := erStartBar
+    prvDemL := ppL
+    prvDemB := prevPrevStartBar
+else
+    extDemL := pwL
+    extDemB := prevStartBar
+    decDemL := ppL
+    decDemB := prevPrevStartBar
+    prvDemL := pppL
+    prvDemB := prevPrevPrevStartBar
+
+// -----------------------------------------------------------------------------
+// ZONE BOXES — 6 persistent handles, updated each bar
+// -----------------------------------------------------------------------------
+var box   bSupExt = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, border_color = color(na), bgcolor = color(na))
+var box   bSupDec = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, border_color = color(na), bgcolor = color(na))
+var box   bSupPrv = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, border_color = color(na), bgcolor = color(na))
+var box   bDemExt = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, border_color = color(na), bgcolor = color(na))
+var box   bDemDec = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, border_color = color(na), bgcolor = color(na))
+var box   bDemPrv = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, border_color = color(na), bgcolor = color(na))
+var label lSupExt = label.new(na, na, "", xloc = xloc.bar_index, color = color(na), textcolor = color(na), style = label.style_label_left, size = size.small)
+var label lSupDec = label.new(na, na, "", xloc = xloc.bar_index, color = color(na), textcolor = color(na), style = label.style_label_left, size = size.small)
+var label lSupPrv = label.new(na, na, "", xloc = xloc.bar_index, color = color(na), textcolor = color(na), style = label.style_label_left, size = size.small)
+var label lDemExt = label.new(na, na, "", xloc = xloc.bar_index, color = color(na), textcolor = color(na), style = label.style_label_left, size = size.small)
+var label lDemDec = label.new(na, na, "", xloc = xloc.bar_index, color = color(na), textcolor = color(na), style = label.style_label_left, size = size.small)
+var label lDemPrv = label.new(na, na, "", xloc = xloc.bar_index, color = color(na), textcolor = color(na), style = label.style_label_left, size = size.small)
+
+supDim = dimCounter and biasBull
+demDim = dimCounter and biasBear
+
+f_zoneBoxT(box b, label l, float top, float bot, int lb, color col, bool dim, string tag) =>
+    if na(top) or na(bot) or na(lb)
+        box.set_bgcolor(b, color.new(col, 100))
+        box.set_border_color(b, color.new(col, 100))
+        label.set_textcolor(l, color.new(color.white, 100))
+    else
+        box.set_left(b, lb)
+        box.set_right(b, bar_index)
+        box.set_top(b, top)
+        box.set_bottom(b, bot)
+        box.set_bgcolor(b, color.new(col, dim ? 92 : 80))
+        box.set_border_color(b, col)
+        label.set_xy(l, bar_index + 5, math.avg(top, bot))
+        label.set_text(l, tag)
+        label.set_textcolor(l, color.white)
+
+// Clean symmetric mirror — supply extends DOWN from its high, demand extends UP
+// from its low, by the tier's ATR depth. Each tier drawn at its TRUE level.
+//   supply box [lvl - depth, lvl]      demand box [lvl, lvl + depth]
+f_zoneBoxT(bSupExt, lSupExt, extSupL, extSupL - extZONE, extSupB, RED,   supDim, "Extreme (Supply)")
+f_zoneBoxT(bSupDec, lSupDec, decSupL, decSupL - decZONE, decSupB, RED,   supDim, "Decisional (Supply)")
+f_zoneBoxT(bSupPrv, lSupPrv, prvSupL, prvSupL - prvZONE, prvSupB, RED,   supDim, "Previous Supply Zone")
+f_zoneBoxT(bDemExt, lDemExt, extDemL + extZONE, extDemL, extDemB, GREEN, demDim, "Extreme (Demand)")
+f_zoneBoxT(bDemDec, lDemDec, decDemL + decZONE, decDemL, decDemB, GREEN, demDim, "Decisional (Demand)")
+f_zoneBoxT(bDemPrv, lDemPrv, prvDemL + prvZONE, prvDemL, prvDemB, GREEN, demDim, "Previous Demand Zone")
+
+// -----------------------------------------------------------------------------
+// CBR SESSION BIAS — each clause is independently toggleable (see inputs).
+//   Trigger  : engulfing (EBP) or any directional candle
+//   Window   : first two session candles or first only
+//   Week     : Tue 00:00 -> Fri 15:00 or always
+//   Location : wick reaches a zone ; optional close-inside-band ; optional P/D sanity
+// -----------------------------------------------------------------------------
+hh = hour(time, TZ)
+hhPrev = hour(time[1], TZ)
+inAsiaWin = hh == hrAsia or hh == (hrAsia + 1) % 24
+inLonWin  = hh == hrLon  or hh == (hrLon  + 1) % 24
+inNYWin   = hh == hrNY   or hh == (hrNY   + 1) % 24
+isFirstCandle  = hh == hrAsia or hh == hrLon or hh == hrNY
+isSecondCandle = hh == (hrAsia + 1) % 24 or hh == (hrLon + 1) % 24 or hh == (hrNY + 1) % 24
+isSessionCandle = useTwoCandle ? (isFirstCandle or isSecondCandle) : (isFirstCandle and hh != hhPrev)
+
+dow = dayofweek(time, TZ)
+afterTueOpen = dow == dayofweek.tuesday or dow == dayofweek.wednesday or dow == dayofweek.thursday or (dow == dayofweek.friday and hh < 15)
+weekOk = useWeekWindow ? afterTueOpen : true
+
+// Dealing range for P/D + equilibrium — maturity-aware (prev week until Wed 08:00).
+float pdH    = weekMature ? erH : pwH
+float pdL    = weekMature ? erL : pwL
+int   pdLeft = weekMature ? erStartBar : prevStartBar
+
+var float eqLevel = na
+eqLevel := (not na(pdH) and not na(pdL)) ? math.avg(pdH, pdL) : na
+
+bearCandle = close < open
+bullCandle = close > open
+
+// PRIOR-candle engulfing (the previous 1H candle engulfs the one before it), opposite-colour
+pOpen  = open[1]
+pClose = close[1]
+ppBodyTop = math.max(open[2], close[2])
+ppBodyBot = math.min(open[2], close[2])
+prevBearEngulf = pClose < pOpen and close[2] > open[2] and pOpen >= ppBodyTop and pClose <= ppBodyBot
+prevBullEngulf = pClose > pOpen and close[2] < open[2] and pOpen <= ppBodyBot and pClose >= ppBodyTop
+bearEngOk = useEngulf ? prevBearEngulf : true
+bullEngOk = useEngulf ? prevBullEngulf : true
+
+// SIGNAL = matching-colour wick lands INSIDE a POI box (between its high and low).
+//   supply box [lvl-depth, lvl] : bearish candle, HIGH inside the box -> Bearish
+//   demand box [lvl, lvl+depth] : bullish candle, LOW  inside the box -> Bullish
+//   close may be outside the box (optional close-inside via toggle). No P/D gate.
+f_supWick(float lvl, float depth) =>
+    closeOk = useCloseInBand ? (close >= lvl - depth and close <= lvl) : true
+    not na(lvl) and bearCandle and high >= lvl - depth and high <= lvl and closeOk
+f_demWick(float lvl, float depth) =>
+    closeOk = useCloseInBand ? (close >= lvl and close <= lvl + depth) : true
+    not na(lvl) and bullCandle and low >= lvl and low <= lvl + depth and closeOk
+
+demExtHit = f_demWick(extDemL, extZONE)
+demDecHit = f_demWick(decDemL, decZONE)
+demPrvHit = f_demWick(prvDemL, prvZONE)
+supExtHit = f_supWick(extSupL, extZONE)
+supDecHit = f_supWick(decSupL, decZONE)
+supPrvHit = f_supWick(prvSupL, prvZONE)
+inDemandZone = demExtHit or demDecHit or demPrvHit
+inSupplyZone = supExtHit or supDecHit or supPrvHit
+
+cbrBearRaw = isSessionCandle and weekOk and inSupplyZone and bearEngOk
+cbrBullRaw = isSessionCandle and weekOk and inDemandZone and bullEngOk and not inSupplyZone
+
+// ONE confirmation per session window: which window are we in, and has it already fired?
+int curWin = inAsiaWin ? 1 : inLonWin ? 2 : inNYWin ? 3 : 0
+var int firedWin = 0
+windowReset = curWin != curWin[1]   // entered a new (or different) session window
+if windowReset
+    firedWin := 0
+cbrBear = cbrBearRaw and firedWin == 0
+cbrBull = cbrBullRaw and firedWin == 0
+if (cbrBear or cbrBull) and curWin != 0
+    firedWin := curWin
+
+int cbrBias = cbrBull ? 1 : cbrBear ? -1 : 0
+
+// latch the most recent fired bias for the dashboard
+var int cbrBiasLast = 0
+if cbrBias != 0
+    cbrBiasLast := cbrBias
+
+// markers — at the close (location.absolute) or above/below the bar, per toggle
+plotshape(showCBRBias and markerAtClose and cbrBull ? close : na, "CBR Bull (close)", style = shape.triangleup,   location = location.absolute, color = GREEN, text = "Bullish", textcolor = color.white, size = size.small)
+plotshape(showCBRBias and markerAtClose and cbrBear ? close : na, "CBR Bear (close)", style = shape.triangledown, location = location.absolute, color = RED,   text = "Bearish", textcolor = color.white, size = size.small)
+plotshape(showCBRBias and not markerAtClose and cbrBull, "CBR Bull (bar)", style = shape.triangleup,   location = location.belowbar, color = GREEN, text = "Bullish", textcolor = color.white, size = size.small)
+plotshape(showCBRBias and not markerAtClose and cbrBear, "CBR Bear (bar)", style = shape.triangledown, location = location.abovebar, color = RED,   text = "Bearish", textcolor = color.white, size = size.small)
+
+// -----------------------------------------------------------------------------
+// PREMIUM / DISCOUNT — on the ER weekly dealing range
+// -----------------------------------------------------------------------------
+var box   premBox = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, bgcolor = color(na), border_color = color(na))
+var box   midBox  = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, bgcolor = color(na), border_color = color(na))
+var box   discBox = box.new(na, na, na, na, xloc = xloc.bar_index, extend = extend.right, bgcolor = color(na), border_color = color(na))
+var label premLbl = label.new(na, na, "Premium",  xloc = xloc.bar_index, color = color(na), textcolor = color.white, style = label.style_label_left, size = size.small)
+var label midLbl  = label.new(na, na, "Mid Zone", xloc = xloc.bar_index, color = color(na), textcolor = color.white, style = label.style_label_left, size = size.small)
+var label discLbl = label.new(na, na, "Discount", xloc = xloc.bar_index, color = color(na), textcolor = color.white, style = label.style_label_left, size = size.small)
+
+// Mid band — 5% around the midpoint. Published to Compass as its own value_zone
+// state: no climate accepts it, so price in the mid fades every strategy.
+midTopLvl = (not na(pdH) and not na(pdL)) ? 0.525 * pdH + 0.475 * pdL : na
+midBotLvl = (not na(pdH) and not na(pdL)) ? 0.525 * pdL + 0.475 * pdH : na
+
+f_pd(box b, label l, float top, float bot, color base) =>
+    box.set_left(b, pdLeft)
+    box.set_right(b, bar_index)
+    box.set_top(b, top)
+    box.set_bottom(b, bot)
+    box.set_bgcolor(b, color.new(base, 90))
+    label.set_xy(l, bar_index + 5, math.avg(top, bot))
+
+if showPD and not na(pdH) and not na(pdL)
+    f_pd(premBox, premLbl, pdH, midTopLvl, RED)
+    f_pd(midBox,  midLbl,  midTopLvl, midBotLvl, GRAY)
+    f_pd(discBox, discLbl, midBotLvl, pdL, GREEN)
+
+// -----------------------------------------------------------------------------
+// ER HIGH/LOW LINES — with history
+// -----------------------------------------------------------------------------
+var array<line>  erHL   = array.new<line>()
+var array<line>  erLL   = array.new<line>()
+var array<label> erHLab = array.new<label>()
+var array<label> erLLab = array.new<label>()
+
+if erEnd and showER
+    array.push(erHL, line.new(erStartBar, erH, bar_index, erH, color = RED, style = line.style_dashed))
+    array.push(erLL, line.new(erStartBar, erL, bar_index, erL, color = GREEN, style = line.style_dashed))
+    array.push(erHLab, label.new(erStartBar, erH, "ER Weekly High", color = color(na), textcolor = color.white, style = label.style_label_right, size = size.tiny))
+    array.push(erLLab, label.new(erStartBar, erL, "ER Weekly Low",  color = color(na), textcolor = color.white, style = label.style_label_right, size = size.tiny))
+    while array.size(erHL) > erWeeks
+        line.delete(array.shift(erHL))
+    while array.size(erLL) > erWeeks
+        line.delete(array.shift(erLL))
+    while array.size(erHLab) > erWeeks
+        label.delete(array.shift(erHLab))
+    while array.size(erLLab) > erWeeks
+        label.delete(array.shift(erLLab))
+    nH = array.size(erHLab)
+    for i = 0 to nH - 1
+        age = nH - 1 - i
+        label.set_text(array.get(erHLab, i), age == 0 ? "ER Weekly High - Current" : "ER Weekly High - prev(" + str.tostring(age) + ")")
+    nL = array.size(erLLab)
+    for i = 0 to nL - 1
+        age = nL - 1 - i
+        label.set_text(array.get(erLLab, i), age == 0 ? "ER Weekly Low - Current" : "ER Weekly Low - prev(" + str.tostring(age) + ")")
+
+// -----------------------------------------------------------------------------
+// MTF LEVELS — PDH/PDL (prev day) and PWH/PWL (prev week)
+// -----------------------------------------------------------------------------
+f_mtf(string tf, bool show, color col, string topTag, string botTag) =>
+    [h, l] = request.security(syminfo.tickerid, tf, [high[1], low[1]], lookahead = barmerge.lookahead_on)
+    var line  tL   = line.new(na, na, na, na, color = col, xloc = xloc.bar_index, extend = extend.right)
+    var line  bL   = line.new(na, na, na, na, color = col, xloc = xloc.bar_index, extend = extend.right)
+    var label tLab = label.new(na, na, topTag, color = color(na), textcolor = col, style = label.style_label_left, size = size.tiny)
+    var label bLab = label.new(na, na, botTag, color = color(na), textcolor = col, style = label.style_label_left, size = size.tiny)
+    if show and not na(h)
+        line.set_xy1(tL, bar_index - 1, h)
+        line.set_xy2(tL, bar_index, h)
+        line.set_xy1(bL, bar_index - 1, l)
+        line.set_xy2(bL, bar_index, l)
+        label.set_xy(tLab, bar_index + 5, h)
+        label.set_xy(bLab, bar_index + 5, l)
+    [h, l]
+
+[pdh, pdl] = f_mtf("D", showPD_D and not higherTF("D"), BLUE, "PDH", "PDL")
+[pwh, pwl] = f_mtf("W", showPW_W and not higherTF("W"), BLUE, "PWH", "PWL")
+
+// -----------------------------------------------------------------------------
+// DASHBOARD
+// -----------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 2, 2, bgcolor = #1e222d, border_color = GRAY, border_width = 1)
+if showDash and barstate.islast
+    biasTxt = biasBull ? "Bullish" : biasBear ? "Bearish" : "Neutral"
+    biasCol = biasBull ? GREEN : biasBear ? RED : GRAY
+    cbrTxtD = cbrBiasLast == 1 ? "Bullish" : cbrBiasLast == -1 ? "Bearish" : "—"
+    cbrColD = cbrBiasLast == 1 ? GREEN : cbrBiasLast == -1 ? RED : GRAY
+    table.cell(dash, 0, 0, "Macro Bias (HH/HL)", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, biasTxt, text_color = biasCol, text_size = size.small)
+    table.cell(dash, 0, 1, "CBR Bias (zone)", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, cbrTxtD, text_color = cbrColD, text_size = size.small)
+
+// =============================================================================
+// COMPASS PUBLISHER
+// =============================================================================
+// Replaces the old data-window plot block: plots do not transmit, so nothing
+// could read them. This sends levels, bias and volatility to Compass on every
+// bar close. No signals, no per-asset config — one script, every chart.
+//
+// Run this chart on 30m. Zones and ER are weekly-derived so they are
+// timeframe-independent; cbr_bias comes from this chart so the payload and
+// the dashboard table can never disagree.
+//
+// Compass derives from these: session_vol_ratio, bar_risk, bias_alignment,
+// the typical session ATR, and the nine zone booleans.
+// =============================================================================
+
+// ── asset router — ticker -> canonical code ──
+// Normalises the broker symbol (XAUUSD.p, GBPUSDm, ...) to the code Compass and
+// the strategy IDs share. Full pairs are tested, so AUDUSD and AUDJPY cannot
+// collide. Same pattern as the sniper suite's detectAsset().
+f_compassAsset() =>
+    string t = str.upper(syminfo.ticker)
+    string code = "UNK"
+    if str.contains(t, "XAU") or str.contains(t, "GOLD")
+        code := "XAUUSD"
+    else if str.contains(t, "EURUSD") or str.contains(t, "EUR/USD")
+        code := "EURUSD"
+    else if str.contains(t, "GBPUSD") or str.contains(t, "GBP/USD")
+        code := "GBPUSD"
+    else if str.contains(t, "GBPJPY") or str.contains(t, "GBP/JPY")
+        code := "GBPJPY"
+    else if str.contains(t, "AUDUSD") or str.contains(t, "AUD/USD")
+        code := "AUDUSD"
+    else if str.contains(t, "AUDJPY") or str.contains(t, "AUD/JPY")
+        code := "AUDJPY"
+    else if str.contains(t, "USDCHF") or str.contains(t, "USD/CHF")
+        code := "USDCHF"
+    else if str.contains(t, "BTCUSD") or str.contains(t, "BTC/USD") or str.contains(t, "XBTUSD")
+        code := "BTCUSD"
+    code
+
+var string compassAsset = f_compassAsset()
+
+var table compassWarn = table.new(position.top_left, 1, 1)
+if barstate.islast and compassEnabled and compassAsset == "UNK"
+    table.cell(compassWarn, 0, 0, "⚠ " + syminfo.ticker + " not in Compass router — nothing published",
+         text_color = color.white, bgcolor = color.new(color.red, 0), text_size = size.small)
+
+// ── volatility yardsticks ──
+// Independent of the zone ATR (atrLen) so Compass's ruler never moves when the
+// zone tuning changes.
+compassAtrDaily   = ta.atr(48)    // 48 x 30m = 24h rolling — the LEVELS yardstick
+compassAtrSession = ta.atr(12)    // 12 x 30m = one 6h session — the VOLATILITY yardstick
+
+// ── cbr bias ──
+// The LATCHED bias (cbrBiasLast), not the momentary cbrBias which is 0 on
+// almost every bar.
+//
+// Taken from THIS CHART, not pulled from 1H. An earlier version used
+// request.security on "60", which meant the dashboard table and the payload
+// could hold different values — the chart showed bearish while Compass
+// computed conflict from a 1H bias that disagreed. The dashboard must be
+// checkable against the chart, so they read the same source.
+
+f_biasWord(int b) => b > 0 ? "bullish" : b < 0 ? "bearish" : "neutral"
+
+// ── value zone ──
+// above_range / below_range are the stronger states of premium / discount.
+// mid_zone is the 5% band drawn above: no Compass climate accepts it, so price
+// sitting there fades every strategy. Deliberate — do not trade the mid.
+f_compassValueZone() =>
+    string vz = "unknown"
+    if not na(pdH) and not na(pdL) and not na(midTopLvl)
+        if close > pdH
+            vz := "above_range"
+        else if close > midTopLvl
+            vz := "premium"
+        else if close < pdL
+            vz := "below_range"
+        else if close < midBotLvl
+            vz := "discount"
+        else
+            vz := "mid_zone"
+    vz
+
+// ── zone tokens ──
+// One token per drawn zone, exactly as Compass's climate rules expect:
+//     inside           -> "decisional_demand"
+//     below its bottom -> "decisional_demand_low"
+//     above its top    -> "decisional_demand_high"
+// Supply boxes are [lvl - depth, lvl]; demand boxes are [lvl, lvl + depth],
+// matching f_zoneBoxT. Zones ACE_MAP has not drawn emit nothing.
+f_zoneToken(string name, float top, float bot) =>
+    string tok = ""
+    if not na(top) and not na(bot)
+        if close < bot
+            tok := name + "_low"
+        else if close > top
+            tok := name + "_high"
+        else
+            tok := name
+    tok
+
+f_compassTokens() =>
+    string j = ""
+    array<string> toks = array.new<string>()
+    array.push(toks, f_zoneToken("extreme_supply",    extSupL,           extSupL - extZONE))
+    array.push(toks, f_zoneToken("decisional_supply", decSupL,           decSupL - decZONE))
+    array.push(toks, f_zoneToken("prev_supply",       prvSupL,           prvSupL - prvZONE))
+    array.push(toks, f_zoneToken("extreme_demand",    extDemL + extZONE, extDemL))
+    array.push(toks, f_zoneToken("decisional_demand", decDemL + decZONE, decDemL))
+    array.push(toks, f_zoneToken("prev_demand",       prvDemL + prvZONE, prvDemL))
+    array.push(toks, f_zoneToken("mid_zone",          midTopLvl,         midBotLvl))
+    for i = 0 to array.size(toks) - 1
+        string tk = array.get(toks, i)
+        if tk != ""
+            j := j + (j == "" ? "" : ",") + '"' + tk + '"'
+    "[" + j + "]"
+
+// ── zone bands ──
+// The tokens above drive the Edge climate rules; these bands drive everything
+// else Compass derives — nearest zone, distance in ATR, position state, and
+// the "Nearest Key Level" row on the dashboard. Without them those stay null
+// and every report is flagged `no_zones`.
+//
+// Supply boxes are [lvl - depth, lvl]; demand boxes are [lvl, lvl + depth],
+// matching f_zoneBoxT. A zone ACE_MAP has not drawn is omitted entirely
+// rather than sent as null.
+f_zoneBand(string name, float top, float bot) =>
+    na(top) or na(bot) ? "" :
+         '"' + name + '":{"top":' + str.tostring(top, format.mintick) +
+         ',"bottom":' + str.tostring(bot, format.mintick) + '}'
+
+f_compassZones() =>
+    string j = ""
+    array<string> bands = array.new<string>()
+    array.push(bands, f_zoneBand("extreme_supply",    extSupL,           extSupL - extZONE))
+    array.push(bands, f_zoneBand("decisional_supply", decSupL,           decSupL - decZONE))
+    array.push(bands, f_zoneBand("prev_supply",       prvSupL,           prvSupL - prvZONE))
+    array.push(bands, f_zoneBand("extreme_demand",    extDemL + extZONE, extDemL))
+    array.push(bands, f_zoneBand("decisional_demand", decDemL + decZONE, decDemL))
+    array.push(bands, f_zoneBand("prev_demand",       prvDemL + prvZONE, prvDemL))
+    array.push(bands, f_zoneBand("mid_zone",          midTopLvl,         midBotLvl))
+    for i = 0 to array.size(bands) - 1
+        string b = array.get(bands, i)
+        if b != ""
+            j := j + (j == "" ? "" : ",") + b
+    j
+
+// ── the alert ──
+// Once per bar close. Compass rejects duplicates on (ticker, tf, bar_time) and
+// rejects anything older than one bar interval, so a late or repeated delivery
+// is discarded rather than acted on.
+if compassEnabled and barstate.isconfirmed and compassAsset != "UNK"
+    string _vz  = f_compassValueZone()
+    string _tok = f_compassTokens()
+    string _zones = f_compassZones()
+    string _bt  = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    string _cp = '{' +
+         '"secret":"'      + compassSecret + '",' +
+         '"ticker":"'      + compassAsset  + '",' +
+         '"tf":"'          + timeframe.period + '",' +
+         '"bar_time":"'    + _bt + '",' +
+         '"close":'        + str.tostring(close, format.mintick) + ',' +
+         '"atr":'          + str.tostring(compassAtrDaily)   + ',' +
+         '"atr_short":'    + str.tostring(compassAtrSession) + ',' +
+         '"bar_high":'     + str.tostring(high, format.mintick) + ',' +
+         '"bar_low":'      + str.tostring(low,  format.mintick) + ',' +
+         '"er_high":'      + (na(pdH) ? "null" : str.tostring(pdH, format.mintick)) + ',' +
+         '"er_low":'       + (na(pdL) ? "null" : str.tostring(pdL, format.mintick)) + ',' +
+         '"value_zone":"'  + _vz + '",' +
+         '"zone_tokens":'  + _tok + ',' +
+         (_zones == "" ? "" : _zones + ",") +
+         '"macro_bias":"'  + f_biasWord(bias) + '",' +
+         '"cbr_bias":"'    + f_biasWord(cbrBiasLast) + '"' +
+         '}'
+    alert(_cp, alert.freq_once_per_bar_close)

@@ -1,0 +1,1375 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// SNIPER_ALPHA — 1m execution layer (Stoch Quad Rotation)
+// ───────────────────────────────────────────────────────────────────────────
+// Hosts two entry strategies — SQRC · SQRR — each long & short. The Stoch Quad
+// Oscillator (four stochastics) is shared CONTEXT only: no pane plots, its calcs
+// feed the gates. The two engines are FULLY INDEPENDENT — own inputs, gates,
+// risk, tracker, stats and alerts; one open position PER ENGINE. Shared context
+// only: oscillator, fractal BOS, DTQ bias, 6h containers / 90m quarters.
+//   SQRC · Stoch Quad Rotation Continuation — deferred completion of SQRR.
+//     A rotation whose D-cross fires but FAILS its swing validation is captured
+//     as SQRC's PENDING (SQRR's own latch is untouched). The next side-relevant
+//     confirmed swing decides it: HL above the rotation level (long) / LH below
+//     (short) → fill. Stop: per-asset FIXED %; fixed-R target.
+//   SQRR · Stoch Quad Rotation Reversal — 6h CONTAINER anchor, trades AGAINST bias.
+//     sweep prev container (G1) → all four stochs latched (G2) → counter-BOS in
+//     the G3 window (G3) → D9 / D14 cross back out, trigger bar prints a local
+//     HL (long) / LH (short) vs the last confirmed swing inside the current 90m
+//     quarter → fill. Stop: per-asset FIXED %; fixed-R target.
+// Engines are independent and run unconditionally; the strategies gate off them.
+//   Quarter (90m) · Container (6h) · DTQ Bias · Stoch Quad · Structure (BOS) · Trade Tracker
+// Library: Sniper_Ammo (structure BOS · order blocks · killzone resolver · bias · payload)
+// Tracker: breakeven @ 0.5R — stats/backtest only, NOT on the alert path.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("SNIPER_ALPHA", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+import Wen_Rich/Sniper_Ammo/14 as ammo
+
+
+// ═══ CONSTANTS ═══════════════════════════════════════════════════════════════
+int DIRECTION_NONE  = 0
+int DIRECTION_LONG  = 1
+int DIRECTION_SHORT = -1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── General ──
+generalGroup = "General"
+anchorTimezone = input.string("Australia/Sydney", "Timezone",
+     options = ["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney", "UTC"],
+     group = generalGroup, tooltip = "Quarter math, sessions and the weekly anchor use this timezone.")
+historyLookbackDays = input.int(3, "History / lookback (days)", minval = 1, maxval = 7, group = generalGroup)
+
+// ── Execution / Routing ──
+routingGroup = "Execution / Routing"
+executionTarget = input.string("dc_exness_mt5_01", "Execution target (MT5 instance)",
+     options = ["dc_exness_mt5_01", "nexus_ftmo_mt5_01"], group = routingGroup,
+     tooltip = "Routed into every payload's execution target. Pick the MT5 instance the bridge delivers to.")
+brokerSymbolOverride = input.string("", "Broker symbol override", group = routingGroup,
+     tooltip = "Optional MT5/Exness symbol override. Leave blank to use the TradingView ticker.")
+blockNewEntriesWhileTradeOpen = input.bool(true, "Block new entries while that engine is in trade", group = routingGroup,
+     tooltip = "One active trade PER ENGINE. While an SQRC trade is open no new SQRC setup arms; likewise SQRR. The two engines are independent of each other.")
+
+// ── Quarterly Anchor ──
+quarterlyAnchorGroup = "Quarterly Anchor Time"
+sessionAnchorStartHour = input.int(10, "S1 start hour (local time)", minval = 0, maxval = 23, group = quarterlyAnchorGroup,
+     tooltip = "Local hour the quarterly structure anchors from. The 6h containers and 90m quarters tile forward from here.")
+
+// ── Quarter Visuals ──
+quarterVisualsGroup = "Quarter Visuals"
+showHourContainerBox = input.bool(true,  "Show 6h container",       group = quarterVisualsGroup)
+showQuarterBoxes     = input.bool(true,  "Show 90m quarter boxes",  group = quarterVisualsGroup)
+showQuarterLabels    = input.bool(false, "Show A/M/D/C labels",     group = quarterVisualsGroup)
+
+// ── Phase Colours ──
+phaseColoursGroup = "Phase Colours (A · M · D · C)"
+accumulationColor = input.color(color.new(#2962FF, 85), "A — Accumulation", group = phaseColoursGroup)
+manipulationColor = input.color(color.new(#E91E63, 85), "M — Manipulation", group = phaseColoursGroup)
+distributionColor = input.color(color.new(#26A69A, 85), "D — Distribution", group = phaseColoursGroup)
+continuationColor = input.color(color.new(#9E9E9E, 85), "C — Continuation", group = phaseColoursGroup)
+
+// ── Structure Engine ──
+structureGroup = "Structure"
+internalPivotLength   = input.int(25, "Internal pivot length", minval = 1, group = structureGroup, tooltip = "ammo.run internalLen — lower = more/earlier breaks. Drives the BOS that SQRR's Gate 3 reads.")
+swingPivotLength      = input.int(50, "Swing pivot length", minval = 1, group = structureGroup, tooltip = "ammo.run swingLen — the reference an internal break must DIFFER from to validate.")
+structureConfluence   = input.bool(true,  "Confluence filter", group = structureGroup, tooltip = "ammo.run confluence — also require a body-position confluence bar.")
+structurePresentMode  = input.bool(false, "Present mode (reuse latest line)", group = structureGroup, tooltip = "ammo.run present — true reuses one structure line; false keeps each historical break line.")
+showStructureBreaks   = input.bool(true, "Draw structure breaks", group = structureGroup)
+bullishStructureColor = input.color(#089981, "Bullish colour", group = structureGroup)
+bearishStructureColor = input.color(#f23645, "Bearish colour", group = structureGroup)
+swingDetectorLength   = input.int(21, "Swing detector length (SQRR stop)", minval = 1, group = structureGroup, tooltip = "Standalone LuxAlgo swing detector (ammo.advanceSwing) — SEPARATE from the BOS engine above. Left=right=this many bars, so a swing confirms this many bars after it prints. SQRR anchors its stop to the most recent CONFIRMED swing (low for long / high for short) wick extreme.")
+
+// ── Order Block Engine (kept for future use; ALPHA does not trade OBs) ──
+orderBlockGroup = "Order Blocks"
+showOrderBlocks       = input.bool(false, "Show order blocks", group = orderBlockGroup)
+maxOrderBlocksKept    = input.int(5, "Max OBs kept / drawn", minval = 1, maxval = 20, group = orderBlockGroup,
+     tooltip = "Passed to the library SMC engine (run maxOB).")
+orderBlockFilter      = input.string("Atr", "OB volatility filter", options = ["Atr", "Cumulative Mean Range"], group = orderBlockGroup,
+     tooltip = "How the library anchors the OB candle. Atr = ATR(200); Cumulative Mean Range = running mean true range.")
+orderBlockMitigation  = input.string("High/Low", "OB mitigation", options = ["Close", "High/Low"], group = orderBlockGroup,
+     tooltip = "Close = OB dies only when price CLOSES through it. High/Low = a wick through removes it.")
+demandOrderBlockColor = input.color(color.new(#3179f5, 0), "Demand (bull) OB colour", group = orderBlockGroup)
+supplyOrderBlockColor = input.color(color.new(#f77c80, 0), "Supply (bear) OB colour", group = orderBlockGroup)
+
+// ── SQRC Strategy ──
+sqrcGroup = "SQRC · Signals"
+sqrcShowGateMarkers = input.bool(true, "Mark gates (debug)", group = sqrcGroup,
+     tooltip = "Marker at the SQRC handoff (C·PEND·L/S — a rotation's D-cross fired but its swing validation failed, captured as SQRC's pending).")
+sqrcGateMarkerColor = input.color(color.new(#AB47BC, 0), "Gate marker colour", group = sqrcGroup)
+sqrcSignalColor     = input.color(color.new(#26C6DA, 0), "Signal colour",      group = sqrcGroup)
+
+// ── SQRR Strategy ──
+sqrrGroup = "SQRR · Signals"
+sqrrShowGateMarkers = input.bool(true, "Mark gates (debug)", group = sqrrGroup,
+     tooltip = "Marker when the quad-stoch latch (G2) sets, at the counter-BOS (G3), and at the D9/D14 cross-back trigger.")
+sqrrGateMarkerColor = input.color(color.new(#AB47BC, 0), "Gate marker colour", group = sqrrGroup)
+sqrrSignalColor     = input.color(color.new(#FFB300, 0), "Signal colour",      group = sqrrGroup)
+
+// ── Risk & Stats ──
+riskStatsGroup = "Risk & Stats"
+showTradeZoneBoxes = input.bool(true, "Show SL/TP zone boxes", group = riskStatsGroup)
+showStatsTable     = input.bool(true, "Show stats table",      group = riskStatsGroup)
+riskDollarsPerR    = input.float(50, "Risk per 1R ($, stats only)", minval = 1, group = riskStatsGroup)
+moveStopToBreakeven = input.bool(true, "Move stop to breakeven at 50% of stop distance", group = riskStatsGroup,
+     tooltip = "TRACKER ONLY — never touches alerts/EA. Once price moves 0.5R in favour, the tracked stop moves to entry and the trade runs to target. Exits at entry count as BE (0R), not a loss.")
+
+// ── Dashboard ──
+dashboardGroup = "Dashboard"
+showUnifiedDashboard = input.bool(true, "Show SNIPER_ALPHA dashboard", group = dashboardGroup)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIG TYPES — the shape of an asset's configuration
+// ═══════════════════════════════════════════════════════════════════════════
+// Killzone schedule is HOST-HELD and CONTAINER-ALIGNED: a list of active CONTAINER
+// SLOTS (ammo.KillzoneContainer), each carrying which of its four 90m quarters
+// (A/M/D/C = quarterIndex 1/2/3/4) trade. The library query (ammo.isKillzoneOpenByContainer)
+// reads the host's own containerIndex + quarterIndex (from resolveContainerQuarter
+// with 6h / 90m sizing) — no separate time math, so it can't drift from the
+// container/quarter clock. ONE killzone per asset, SHARED by both engines (SQRC / SQRR).
+type KillzoneConfig
+    bool   restrictEnabled
+    array<ammo.KillzoneHour> activeHours
+
+// Shared bias settings (DTQ quarter bias). No volume engine in ALPHA.
+type SharedConfig
+    int    biasConfirmCount
+
+// Per-asset FIXED stop. One number, all entry modes (TRIG, DEC, staged): stop =
+// entry ± this % of price; target = engine targetRMultiple × that distance.
+// Structural stop levels and the min/max band are retired from the live paths.
+type RiskConfig
+    float  fixedStopPercent    // fixed stop distance as % of entry price
+
+// SQRC — Stoch Quad Rotation Continuation (deferred completion of SQRR).
+//   biasFilterEnabled : OPTIONAL DTQ bias agreement (validation; off → both sides)
+//   targetRMultiple   : target = this multiple of the fixed stop distance
+//   ENTRY MODES (per asset):
+//     entryDec = DEC · deferred swing-decision entry (the original SQRC path)
+//     entryL1  = L1/S1 · immediate entry on the handoff bar (replaces DEC when true)
+type SqrcConfig
+    bool   enabled
+    bool   biasFilterEnabled
+    float  targetRMultiple
+    bool   entryDec
+    bool   entryL1
+
+// SQRR — Stoch Quad Rotation Reversal (6h container anchor, trades AGAINST bias).
+//   gate1Enabled          : OPTIONAL prev-container sweep (G1)
+//   gate3Enabled          : OPTIONAL counter-BOS confirmation (G3)
+//   gate3WindowQuarters   : G3 must land within this many 90m quarters of the latch
+//   biasFilterEnabled     : OPTIONAL DTQ bias opposition (validation; off → both sides)
+//   targetRMultiple       : target = this multiple of the fixed stop distance
+//   ENTRY MODES (per asset):
+//     entryTrig = classic D-cross + swing-validation entry (the original SQRR path)
+//     entryL1   = L1/S1 · Gate 1 container-sweep bar
+//     entryL2   = L2/S2 · Gate 2 quad-latch bar
+//     entryL3   = L3/S3 · Gate 3 counter-BOS bar
+type SqrrConfig
+    bool   enabled
+    string trigMode              // "Ultra Fast" (D9) | "Fast" (D14)
+    bool   gate1Enabled
+    bool   gate3Enabled
+    int    gate3WindowQuarters
+    bool   biasFilterEnabled
+    float  targetRMultiple
+    bool   entryTrig
+    bool   entryL1
+    bool   entryL2
+    bool   entryL3
+
+type AssetConfig
+    string         assetCode
+    bool           isKnownAsset
+    SharedConfig   shared
+    RiskConfig     risk
+    KillzoneConfig killzone        // shared by SQRC / SQRR
+    SqrcConfig     sqrc
+    SqrrConfig     sqrr
+
+// ── killzone helper ──────────────────────────────────────────────────────────
+// Container-aligned: enable a whole container slot (0–3) with all four 90m quarters
+// tradeable. SQRR gates at container level (any quarter in an active container is
+// fine); SQRC reads the quarter dimension. To restrict specific quarters, build a
+// KillzoneContainer by hand instead of using this helper.
+activeHour(int hourOfDay) =>
+    ammo.KillzoneHour.new(hourOfDay, false, true, true, true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PER-ASSET CONFIG — one self-contained block per asset (no base + override).
+// Each block spells out EVERYTHING that asset uses: stop band, both engine enables,
+// every engine's tuning, and its killzone containers inline. Read one block
+// top-to-bottom and you know exactly how that asset trades.
+//   Container slots (S1 anchor = 10:00):  0 = 10:00–16:00 · 1 = 16:00–22:00
+//                                         2 = 22:00–04:00 · 3 = 04:00–10:00
+//   STOP BANDS + KILLZONE CONTAINERS below are placeholders — tune per asset.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── AUD/JPY (FX major) ──
+buildConfigAUDJPY() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, activeHour(0))
+    array.push(killzoneHours, activeHour(1))
+    array.push(killzoneHours, activeHour(2))
+    array.push(killzoneHours, activeHour(3))
+    array.push(killzoneHours, activeHour(4))
+    array.push(killzoneHours, activeHour(7))
+    array.push(killzoneHours, activeHour(8))
+    array.push(killzoneHours, activeHour(9))
+    array.push(killzoneHours, activeHour(10))
+    array.push(killzoneHours, activeHour(11))
+    array.push(killzoneHours, activeHour(12))
+    array.push(killzoneHours, activeHour(13))
+    array.push(killzoneHours, activeHour(14))
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20))
+    array.push(killzoneHours, activeHour(21))
+    array.push(killzoneHours, activeHour(22))
+    array.push(killzoneHours, activeHour(23))
+    AssetConfig.new("AUDJPY", true,
+         SharedConfig.new(biasConfirmCount = 1),
+         RiskConfig.new(fixedStopPercent = 0.07),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = true, targetRMultiple = 3.0, entryDec = true, entryL1 = false),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 1, biasFilterEnabled = true, targetRMultiple = 1.0, entryTrig = false, entryL1 = true, entryL2 = false, entryL3 = true))
+
+// ── XAU/USD (gold) — also the fallback for unknown tickers ──
+buildConfigBTCUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, activeHour(0))
+    array.push(killzoneHours, activeHour(1))
+    array.push(killzoneHours, activeHour(2))
+    array.push(killzoneHours, activeHour(3))
+    array.push(killzoneHours, activeHour(4))
+    array.push(killzoneHours, activeHour(5))
+    array.push(killzoneHours, activeHour(6))
+    array.push(killzoneHours, activeHour(9))
+    array.push(killzoneHours, activeHour(10))   // list the hours you want
+    array.push(killzoneHours, activeHour(11))
+    array.push(killzoneHours, activeHour(12))
+    array.push(killzoneHours, activeHour(13))
+    array.push(killzoneHours, activeHour(14))
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20)) 
+    array.push(killzoneHours, activeHour(21))
+    array.push(killzoneHours, activeHour(22))
+    array.push(killzoneHours, activeHour(23))
+    AssetConfig.new("BTCUSD", true,
+         SharedConfig.new(biasConfirmCount = 1),
+         RiskConfig.new(fixedStopPercent = 0.30),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = false, targetRMultiple = 3.0, entryDec = true, entryL1 = false),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 2, biasFilterEnabled = true, targetRMultiple = 1.0, entryTrig = true, entryL1 = true, entryL2 = true, entryL3 = false))
+
+
+// ── XAU/USD (gold) — also the fallback for unknown tickers ──
+buildConfigGBPJPY() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, activeHour(0))
+    array.push(killzoneHours, activeHour(1))
+    array.push(killzoneHours, activeHour(2))
+    array.push(killzoneHours, activeHour(3))
+    array.push(killzoneHours, activeHour(4))
+    array.push(killzoneHours, activeHour(5))
+    array.push(killzoneHours, activeHour(6))
+    array.push(killzoneHours, activeHour(9))
+    array.push(killzoneHours, activeHour(10))   // list the hours you want
+    array.push(killzoneHours, activeHour(11))
+    array.push(killzoneHours, activeHour(12))
+    array.push(killzoneHours, activeHour(13))
+    array.push(killzoneHours, activeHour(14))
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20)) 
+    array.push(killzoneHours, activeHour(21))
+    array.push(killzoneHours, activeHour(22))
+    array.push(killzoneHours, activeHour(23))
+    AssetConfig.new("GBPJPY", true,
+         SharedConfig.new(biasConfirmCount = 1),
+         RiskConfig.new(fixedStopPercent = 0.12),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = false, targetRMultiple = 3.0, entryDec = true, entryL1 = false),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 2, biasFilterEnabled = true, targetRMultiple = 1.0, entryTrig = true, entryL1 = true, entryL2 = true, entryL3 = false))
+
+// ── EUR/USD ──
+buildConfigEURUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()   
+    array.push(killzoneHours, activeHour(0))
+    array.push(killzoneHours, activeHour(3))
+    array.push(killzoneHours, activeHour(4))
+    array.push(killzoneHours, activeHour(5))
+    array.push(killzoneHours, activeHour(8))
+    array.push(killzoneHours, activeHour(9))
+    array.push(killzoneHours, activeHour(10))
+    array.push(killzoneHours, activeHour(11))
+    array.push(killzoneHours, activeHour(12))
+    array.push(killzoneHours, activeHour(13))
+    array.push(killzoneHours, activeHour(14))
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20))
+    array.push(killzoneHours, activeHour(21))
+    array.push(killzoneHours, activeHour(22))
+    array.push(killzoneHours, activeHour(23))
+    AssetConfig.new("EURUSD", true,
+         SharedConfig.new(biasConfirmCount = 2),
+         RiskConfig.new(fixedStopPercent = 0.05),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = true, targetRMultiple = 2.0, entryDec = true, entryL1 = true),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 2, biasFilterEnabled = false, targetRMultiple = 1.0, entryTrig = false, entryL1 = true, entryL2 = true, entryL3 = true))
+
+// ── GBP/USD ──
+buildConfigGBPUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()   
+    array.push(killzoneHours, activeHour(9))
+    array.push(killzoneHours, activeHour(10))
+    array.push(killzoneHours, activeHour(11))
+    array.push(killzoneHours, activeHour(12))
+    array.push(killzoneHours, activeHour(13))
+    array.push(killzoneHours, activeHour(14))
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20))
+    array.push(killzoneHours, activeHour(21))
+    array.push(killzoneHours, activeHour(22))
+    array.push(killzoneHours, activeHour(23))
+    AssetConfig.new("GBPUSD", true,
+         SharedConfig.new(biasConfirmCount = 1),
+         RiskConfig.new(fixedStopPercent = 0.06),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = true, targetRMultiple = 1.5, entryDec = true, entryL1 = false),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 2, biasFilterEnabled = false, targetRMultiple = 1.0, entryTrig = true, entryL1 = true, entryL2 = true, entryL3 = false))
+
+// ── USD/CHF (FX major) ──
+buildConfigUSDCHF() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()                      // TODO tune 
+    array.push(killzoneHours, activeHour(2))
+    array.push(killzoneHours, activeHour(3))  
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20)) 
+    array.push(killzoneHours, activeHour(21)) 
+    array.push(killzoneHours, activeHour(22))
+    AssetConfig.new("USDCHF", true,
+         SharedConfig.new(biasConfirmCount = 1),
+         RiskConfig.new(fixedStopPercent = 0.07),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = true, targetRMultiple = 1.5, entryDec = false, entryL1 = false),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 2, biasFilterEnabled = false, targetRMultiple = 1.0, entryTrig = false, entryL1 = true, entryL2 = false, entryL3 = true))
+
+// ── XAU/USD (gold) — also the fallback for unknown tickers ──
+buildConfigXAUUSD(string assetCode, bool isKnownAsset) =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, activeHour(0))
+    array.push(killzoneHours, activeHour(1))
+    array.push(killzoneHours, activeHour(2))
+    array.push(killzoneHours, activeHour(3))
+    array.push(killzoneHours, activeHour(4))
+    array.push(killzoneHours, activeHour(5))
+    array.push(killzoneHours, activeHour(6))
+    array.push(killzoneHours, activeHour(9))
+    array.push(killzoneHours, activeHour(10))
+    array.push(killzoneHours, activeHour(11))
+    array.push(killzoneHours, activeHour(12))
+    array.push(killzoneHours, activeHour(13))
+    array.push(killzoneHours, activeHour(14))
+    array.push(killzoneHours, activeHour(15))
+    array.push(killzoneHours, activeHour(16))
+    array.push(killzoneHours, activeHour(17))
+    array.push(killzoneHours, activeHour(18))
+    array.push(killzoneHours, activeHour(19))
+    array.push(killzoneHours, activeHour(20))
+    array.push(killzoneHours, activeHour(21))
+    array.push(killzoneHours, activeHour(22))
+    array.push(killzoneHours, activeHour(23))
+    AssetConfig.new(assetCode, isKnownAsset,
+         SharedConfig.new(biasConfirmCount = 1),
+         RiskConfig.new(fixedStopPercent = 0.20),   // seed = old band min — tune
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         SqrcConfig.new(enabled = false, biasFilterEnabled = false, targetRMultiple = 3.0, entryDec = true, entryL1 = false),
+         SqrrConfig.new(enabled = true, trigMode = "Fast", gate1Enabled = true, gate3Enabled = true, gate3WindowQuarters = 2, biasFilterEnabled = true, targetRMultiple = 1.0, entryTrig = true, entryL1 = true, entryL2 = true, entryL3 = false))
+
+
+// ── asset router — ticker → its config block ──
+detectAsset() =>
+    string upperTicker = str.upper(syminfo.ticker)
+    AssetConfig assetConfig = na
+    if str.contains(upperTicker, "XAU") or str.contains(upperTicker, "GOLD")
+        assetConfig := buildConfigXAUUSD("XAUUSD", true)
+    else if str.contains(upperTicker, "EURUSD") or str.contains(upperTicker, "EUR/USD")
+        assetConfig := buildConfigEURUSD()
+    else if str.contains(upperTicker, "GBPJPY") or str.contains(upperTicker, "GBP/JPY")
+        assetConfig := buildConfigGBPJPY()
+    else if str.contains(upperTicker, "GBPUSD") or str.contains(upperTicker, "GBP/USD")
+        assetConfig := buildConfigGBPUSD()
+    else if str.contains(upperTicker, "USDCHF") or str.contains(upperTicker, "USD/CHF")
+        assetConfig := buildConfigUSDCHF()   
+    else if str.contains(upperTicker, "AUDJPY") or str.contains(upperTicker, "AUD/JPY")
+        assetConfig := buildConfigAUDJPY()
+    else if str.contains(upperTicker, "BTCUSD") or str.contains(upperTicker, "BTC/USD")
+        assetConfig := buildConfigBTCUSD()
+    else
+        assetConfig := buildConfigXAUUSD("UNK", false)
+    assetConfig
+
+var AssetConfig assetConfig = detectAsset()
+
+var table unknownAssetWarning = table.new(position.top_left, 1, 1)
+if barstate.islast and not assetConfig.isKnownAsset
+    table.cell(unknownAssetWarning, 0, 0, "⚠ " + syminfo.ticker + " not in config — using XAUUSD defaults", text_color = color.white, bgcolor = color.new(color.red, 0), text_size = size.small)
+
+// ═══ CURRENT TIME ════════════════════════════════════════════════════════════
+hourLocal   = hour  (time, anchorTimezone)
+minuteLocal = minute(time, anchorTimezone)
+phaseLetter(int quarterIndex) => quarterIndex == 1 ? "A" : quarterIndex == 2 ? "M" : quarterIndex == 3 ? "D" : "C"
+phaseColor(int quarterIndex)  => quarterIndex == 1 ? accumulationColor : quarterIndex == 2 ? manipulationColor : quarterIndex == 3 ? distributionColor : continuationColor
+string timestampLocal = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssXXX", anchorTimezone)
+string timestampUtc   = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+
+// ═══ TIME MATH — resolve via library (6h container / 90m quarter) ════════════
+// ALPHA tiles 6h containers and 90m quarters: pass 360 / 90 to the library's
+// parameterised resolver. quarterIndex stays 1–4 (A/M/D/C), containerIndex 0–3
+// across the day — both clock-derived, so they never drift across weekends/gaps.
+[containerIndex, quarterIndex] = ammo.resolveContainerQuarter(time, anchorTimezone, sessionAnchorStartHour, 360, 90)
+string killzoneWindowName      = ammo.sessionName(hourLocal)
+tradeBlackout() => ammo.isWeekendBlackout(time, anchorTimezone, sessionAnchorStartHour)
+
+// ═══ QUARTERLY ENGINE — VISUAL OUTPUT ════════════════════════════════════════
+type ContainerVisual
+    int   containerKey  = na
+    box   containerBox  = na
+    float runningHigh   = na
+    float runningLow    = na
+
+type QuarterVisual
+    int   quarterKey   = na
+    box   quarterBox   = na
+    label quarterLabel = na
+
+var ContainerVisual currentContainerVisual = ContainerVisual.new()
+var QuarterVisual   currentQuarterVisual   = QuarterVisual.new()
+var array<box>           containerBoxHistory  = array.new<box>()
+var array<QuarterVisual> quarterVisualHistory = array.new<QuarterVisual>()
+
+// 6h containers → 4/day ; 90m quarters → 16/day. Cap to the lookback window.
+int containerBoxCap = math.min(historyLookbackDays * 4,  40)
+int quarterBoxCap   = math.min(historyLookbackDays * 16, 160)
+
+capContainerBoxHistory(array<box> boxHistory, box newBox, int cap) =>
+    array.push(boxHistory, newBox)
+    while array.size(boxHistory) > cap
+        box oldestBox = array.shift(boxHistory)
+        if not na(oldestBox)
+            box.delete(oldestBox)
+
+capQuarterVisualHistory(array<QuarterVisual> visualHistory, QuarterVisual newVisual, int cap) =>
+    array.push(visualHistory, newVisual)
+    while array.size(visualHistory) > cap
+        QuarterVisual oldestVisual = array.shift(visualHistory)
+        if not na(oldestVisual)
+            if not na(oldestVisual.quarterBox)
+                box.delete(oldestVisual.quarterBox)
+            if not na(oldestVisual.quarterLabel)
+                label.delete(oldestVisual.quarterLabel)
+
+updateContainerVisual() =>
+    bool isNewContainer = na(currentContainerVisual.containerKey) or currentContainerVisual.containerKey != containerIndex
+    if isNewContainer
+        if not na(currentContainerVisual.containerBox)
+            box.set_right(currentContainerVisual.containerBox, time)
+        currentContainerVisual.runningHigh  := high
+        currentContainerVisual.runningLow   := low
+        currentContainerVisual.containerKey := containerIndex
+        if showHourContainerBox
+            box newContainerBox = box.new(time, high, time, low, xloc = xloc.bar_time,
+                 border_color = color.new(color.orange, 40), border_style = line.style_dashed, bgcolor = color.new(color.gray, 100))
+            capContainerBoxHistory(containerBoxHistory, newContainerBox, containerBoxCap)
+            currentContainerVisual.containerBox := newContainerBox
+    else
+        currentContainerVisual.runningHigh := math.max(currentContainerVisual.runningHigh, high)
+        currentContainerVisual.runningLow  := math.min(currentContainerVisual.runningLow,  low)
+        if showHourContainerBox and not na(currentContainerVisual.containerBox)
+            box.set_top   (currentContainerVisual.containerBox, currentContainerVisual.runningHigh)
+            box.set_bottom(currentContainerVisual.containerBox, currentContainerVisual.runningLow)
+            box.set_right (currentContainerVisual.containerBox, time)
+    int(na)
+
+updateQuarterVisual() =>
+    int quarterKey = containerIndex * 10 + quarterIndex
+    color quarterColor = phaseColor(quarterIndex)
+    bool isNewQuarter = na(currentQuarterVisual.quarterKey) or currentQuarterVisual.quarterKey != quarterKey
+    if isNewQuarter
+        box newQuarterBox = box.new(time, high, time_close, low, xloc = xloc.bar_time,
+             border_color = color.new(quarterColor, 30), border_style = line.style_dotted, bgcolor = quarterColor)
+        label newQuarterLabel = na
+        if showQuarterLabels
+            // 90m quarter half-width ≈ 45min (2_700_000 ms) to centre the label
+            newQuarterLabel := label.new(time + 2700000, (high + low) / 2, phaseLetter(quarterIndex),
+                 xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, textcolor = color.white, size = size.normal)
+        QuarterVisual newQuarterVisual = QuarterVisual.new(quarterKey, newQuarterBox, newQuarterLabel)
+        capQuarterVisualHistory(quarterVisualHistory, newQuarterVisual, quarterBoxCap)
+        currentQuarterVisual.quarterKey   := newQuarterVisual.quarterKey
+        currentQuarterVisual.quarterBox   := newQuarterVisual.quarterBox
+        currentQuarterVisual.quarterLabel := newQuarterVisual.quarterLabel
+    if not isNewQuarter and not na(currentQuarterVisual.quarterBox)
+        box.set_right (currentQuarterVisual.quarterBox, time_close)
+        box.set_top   (currentQuarterVisual.quarterBox, math.max(box.get_top   (currentQuarterVisual.quarterBox), high))
+        box.set_bottom(currentQuarterVisual.quarterBox, math.min(box.get_bottom(currentQuarterVisual.quarterBox), low))
+        if showQuarterLabels and not na(currentQuarterVisual.quarterLabel)
+            label.set_y(currentQuarterVisual.quarterLabel, (box.get_top(currentQuarterVisual.quarterBox) + box.get_bottom(currentQuarterVisual.quarterBox)) / 2)
+    int(na)
+
+if not tradeBlackout()
+    updateContainerVisual()
+    if showQuarterBoxes
+        updateQuarterVisual()
+
+// quarter sequence counter (90m quarters; consumed by SQRR's G3 window + gate timing)
+var int quarterSequence = 0
+if ta.change(quarterIndex) != 0
+    quarterSequence += 1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCAL ENGINE CONFIGS
+// ═══════════════════════════════════════════════════════════════════════════
+biasConfirmCount = assetConfig.shared.biasConfirmCount
+
+fixedStopDistance = ammo.percentToDistance(close, assetConfig.risk.fixedStopPercent)
+
+// ── Stoch Quad oscillator (FIXED definition — shared context, not per-asset) ──
+// Four stochastics; each raw %K is smoothed by its own D length to produce that
+// band's %D LINE (Kurisko "D-line only, %K transparent"). The trigger/latch read
+// the %D lines, never raw %K. The fast pair (D9 / D14) drive the cross-back
+// trigger; all four %D lines feed the extreme latch (G2).
+//   NOTE: band 3 here is 40,4 — Kurisko's reference spec is 44. Latch-only band
+//   (not a trigger); change stochKLength3 to 44 to match his setup exactly.
+//   NOTE: stochAvgType is EMA; classic stochastic %D is SMA. Latch/cross timing
+//   shifts with this choice — set to "SMA" to replicate his chart precisely.
+int    stochKLength1 = 9      // D9  (9,3)   — trigger + latch
+int    stochDSmooth1 = 3
+int    stochKLength2 = 14     // D14 (14,3)  — trigger + latch
+int    stochDSmooth2 = 3
+int    stochKLength3 = 40     // (40,4 — spec is 44) — latch only
+int    stochDSmooth3 = 4
+int    stochKLength4 = 60     // D60 (60,10) — latch only
+int    stochDSmooth4 = 10
+string stochAvgType  = "EMA"
+float  stochOverbought = 80.0
+float  stochOversold   = 20.0
+
+// ── Scalp Bias grid (FIXED — 1h container / 15m quarter; DECOUPLED from the
+//    6h/90m session grid, used ONLY by the DTQ bias accumulator) ──
+int    biasContainerMinutes = 60
+int    biasQuarterMinutes   = 15
+string biasLabel            = "Scalp Bias"
+
+// ── SQRC (continuation, 90m quarter anchor) ──
+sqrcEnabled            = assetConfig.sqrc.enabled
+sqrcBiasFilterEnabled  = assetConfig.sqrc.biasFilterEnabled
+sqrcTargetRMultiple    = assetConfig.sqrc.targetRMultiple
+sqrcEntryDec     = assetConfig.sqrc.entryDec
+sqrcEntryL1      = assetConfig.sqrc.entryL1
+
+// ── SQRR (reversal, 6h container anchor) ──
+sqrrEnabled              = assetConfig.sqrr.enabled
+sqrrTrigMode             = assetConfig.sqrr.trigMode
+sqrrGate1Enabled         = assetConfig.sqrr.gate1Enabled
+sqrrGate3Enabled         = assetConfig.sqrr.gate3Enabled
+sqrrGate3WindowQuarters  = assetConfig.sqrr.gate3WindowQuarters
+sqrrBiasFilterEnabled    = assetConfig.sqrr.biasFilterEnabled
+sqrrTargetRMultiple      = assetConfig.sqrr.targetRMultiple
+sqrrEntryTrig           = assetConfig.sqrr.entryTrig
+sqrrEntryL1          = assetConfig.sqrr.entryL1
+sqrrEntryL2          = assetConfig.sqrr.entryL2
+sqrrEntryL3            = assetConfig.sqrr.entryL3
+
+// killzone (shared by SQRC / SQRR)
+killzoneConfig = assetConfig.killzone
+
+// ═══ ENG_1: STRUCTURE ENGINE — library SMC ═══════════════════════════════════
+// Feeds SQRR's Gate 3: a counter-direction BOS confirming exhaustion before the
+// reversal. A LONG reversal wants a BEARISH break (bearishStructureBreak); a
+// SHORT wants bullishStructureBreak. These are continuation BOS (bosBull/bosBear),
+// NOT reversal MSB/CHoCH. OB/FVG drawing is wired but off by default (kept for
+// future use; ALPHA trades neither). MSB lines still draw when showStructureBreaks is on.
+var ammo.smcState structureState = ammo.newState()
+ammo.smcResult structureResult = ammo.run(internalLen = internalPivotLength, swingLen = swingPivotLength,
+     confluence = structureConfluence, present = structurePresentMode,
+     showMSB = showStructureBreaks, bullCol = bullishStructureColor, bearCol = bearishStructureColor,
+     showOB = showOrderBlocks, maxOB = maxOrderBlocksKept, obFilter = orderBlockFilter, obMitigation = orderBlockMitigation, obBullCol = demandOrderBlockColor, obBearCol = supplyOrderBlockColor,
+     showFVG = false, st = structureState)
+bool bullishStructureBreak = structureResult.bosBull
+bool bearishStructureBreak = structureResult.bosBear
+
+// ═══ ENG_1b: SWING ENGINE — standalone confirmed-pivot tracker ═══════════════
+// Dedicated LuxAlgo swing detector (ammo.advanceSwing), SEPARATE from the BOS
+// engine above. Latches the most recent CONFIRMED pivot high/low wick extreme.
+// SQRR anchors its stop here: long → lastSwingLow (below entry), short →
+// lastSwingHigh (above entry). Runs unconditionally so the swing record is always
+// current the moment a signal fires. Not wired to SQRC (future use).
+var ammo.SwingState swingState = ammo.newSwingState()
+ammo.advanceSwing(swingState, swingDetectorLength)
+
+// ═══ ENG_2: STOCH QUAD ENGINE — shared CONTEXT for both engines ══════════════
+// Four stochastics on the chart timeframe (no MTF / request.security). Each raw
+// %K is smoothed by the library MA (stochAvgType, default EMA) over its own D
+// length. The ultra-fast + fast pair drive the cross-back TRIGGER; all four feed
+// the extreme LATCH (Gate 2). No pane plots — overlay script, calcs are context only.
+
+// ── raw %K for one stochastic (0–100, clamped) ──
+stochRawK(float kLength) =>
+    float highestHigh = ta.highest(high, int(kLength))
+    float lowestLow   = ta.lowest(low,  int(kLength))
+    float priceRange  = highestHigh - lowestLow
+    float rawK        = priceRange != 0 ? 100.0 * (close - lowestLow) / priceRange : 50.0
+    math.min(math.max(rawK, 0.0), 100.0)
+
+// ── the four smoothed stochs (library MA, per-D-length; EMA by default) ──
+// movingAverage EMA is stateful per call site → call once each, top level.
+float stochUltraFast = ammo.movingAverage(stochRawK(stochKLength1), stochDSmooth1, stochAvgType)   // D9  (%D of 9,3)
+float stochFast      = ammo.movingAverage(stochRawK(stochKLength2), stochDSmooth2, stochAvgType)   // D14 (%D of 14,3)
+float stochSlow      = ammo.movingAverage(stochRawK(stochKLength3), stochDSmooth3, stochAvgType)   // D40 (%D of 40,4)
+float stochSlowest   = ammo.movingAverage(stochRawK(stochKLength4), stochDSmooth4, stochAvgType)   // D60 (%D of 60,10)
+
+// ── Quad Extreme conditions (Gate 2 latch source; both engines read these) ──
+bool stochQuadAllOversold   = stochUltraFast < stochOversold   and stochFast < stochOversold   and stochSlow < stochOversold   and stochSlowest < stochOversold
+bool stochQuadAllOverbought = stochUltraFast > stochOverbought and stochFast > stochOverbought and stochSlow > stochOverbought and stochSlowest > stochOverbought
+
+// ── Trigger cross primitives (each engine composes its own trigger from these) ──
+bool triggerUltraFastCrossUp   = ta.crossover (stochUltraFast, stochOversold)     // D9  LONG  — cross up out of oversold
+bool triggerUltraFastCrossDown = ta.crossunder(stochUltraFast, stochOverbought)   // D9  SHORT — cross down out of overbought
+bool triggerFastCrossUp        = ta.crossover (stochFast,      stochOversold)     // D14 LONG
+bool triggerFastCrossDown      = ta.crossunder(stochFast,      stochOverbought)   // D14 SHORT
+
+// ═══ ENG_3: BIAS ENGINE — DTQ scalp bias (1h container / 15m quarter) ════════
+// DECOUPLED from the 6h/90m session grid: the bias accumulates on its OWN scalp
+// grid via a second call to the library resolver (biasContainerMinutes /
+// biasQuarterMinutes). Each closed 15m scalp-quarter is scored against the prior
+// one (ammo.evaluateBias); a streak of biasConfirmCount ratifies the bias. Both
+// engines read biasVerdict.ratifiedBiasId (SQRC wants agreement, SQRR opposition).
+type BiasVerdict
+    int   ratifiedBiasId  = 0
+    int   marketStateId   = 0
+    int   closeTime       = na
+    int   spotBiasId      = 0
+    int   bullishStreak   = 0
+    int   bearishStreak   = 0
+
+// scalp-bias grid — independent of containerIndex/quarterIndex (the session grid)
+[biasContainerIndex, biasQuarterIndex] = ammo.resolveContainerQuarter(time, anchorTimezone, sessionAnchorStartHour, biasContainerMinutes, biasQuarterMinutes)
+
+var ammo.PeriodOHLC biasQuarter = ammo.PeriodOHLC.new()
+var BiasVerdict     biasVerdict = BiasVerdict.new()
+
+if not tradeBlackout()
+    ammo.advancePeriod(biasQuarter, biasContainerIndex * 100 + biasQuarterIndex, bar_index, open, high, low, close)
+    if biasQuarter.justClosed and not na(biasQuarter.previousClosedHigh)
+        [spotBias, marketState] = ammo.evaluateBias(biasQuarter.closedHigh, biasQuarter.closedLow, biasQuarter.previousClosedHigh, biasQuarter.previousClosedLow)
+        if spotBias == ammo.BIAS_BULLISH
+            biasVerdict.bullishStreak := biasVerdict.bullishStreak + 1
+            biasVerdict.bearishStreak := 0
+        if spotBias == ammo.BIAS_BEARISH
+            biasVerdict.bearishStreak := biasVerdict.bearishStreak + 1
+            biasVerdict.bullishStreak := 0
+        if spotBias == ammo.BIAS_RANGING
+            biasVerdict.bullishStreak := 0
+            biasVerdict.bearishStreak := 0
+        int ratifiedBias = ammo.BIAS_RANGING
+        if biasVerdict.bullishStreak >= biasConfirmCount
+            ratifiedBias := ammo.BIAS_BULLISH
+        if biasVerdict.bearishStreak >= biasConfirmCount
+            ratifiedBias := ammo.BIAS_BEARISH
+        biasVerdict.spotBiasId     := spotBias
+        biasVerdict.ratifiedBiasId := ratifiedBias
+        biasVerdict.marketStateId  := marketState
+        biasVerdict.closeTime      := time
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENG_4: TRADE TRACKER ENGINE — one open position PER ENGINE (SQRC, SQRR)
+// ───────────────────────────────────────────────────────────────────────────
+// Same-bar fill model (the trigger bar IS the entry bar) — no pending/arm fields.
+// Two INDEPENDENT trackers: sqrcTrade and sqrrTrade. Each engine resolves and
+// tallies its own trade in its FA block; this block holds the shared type + helpers.
+// Breakeven (tracker only — never on the alert path):
+//   Once price moves 50% of the ORIGINAL stop distance (0.5R) in favour, the
+//   tracked stop moves to entry ONCE and the trade runs to the original target.
+//   Exit at entry after the move records 0R (breakeven), not a loss.
+//   R multiples are always measured against initialRisk (the original stop),
+//   never the moved stop.
+// ═══════════════════════════════════════════════════════════════════════════
+type StrategyTrade
+    int   direction   = 0
+    float entryPrice  = na
+    float stopPrice   = na
+    float targetPrice = na
+    float initialRisk = na
+    bool  beArmed     = false
+    bool  open        = false
+    box   stopBox     = na
+    box   targetBox   = na
+
+// stop-first resolution of an open trade → [stillOpen, realisedRMultiple] (R na while open)
+resolveStrategyTrade(StrategyTrade strategyTrade) =>
+    bool  stillOpen         = strategyTrade.open
+    float realisedRMultiple = na
+    if strategyTrade.open and not na(strategyTrade.stopPrice) and not na(strategyTrade.targetPrice)
+        float riskDistance = na(strategyTrade.initialRisk) ? math.abs(strategyTrade.entryPrice - strategyTrade.stopPrice) : strategyTrade.initialRisk
+        // ── breakeven arm — 0.5R in favour → stop walks to entry (once) ──
+        if moveStopToBreakeven and not strategyTrade.beArmed and riskDistance > 0
+            float beTrigger = strategyTrade.direction == DIRECTION_LONG ?
+                 strategyTrade.entryPrice + 0.5 * riskDistance :
+                 strategyTrade.entryPrice - 0.5 * riskDistance
+            if (strategyTrade.direction == DIRECTION_LONG and high >= beTrigger) or (strategyTrade.direction == DIRECTION_SHORT and low <= beTrigger)
+                strategyTrade.stopPrice := strategyTrade.entryPrice
+                strategyTrade.beArmed   := true
+                if not na(strategyTrade.stopBox)
+                    box.set_top   (strategyTrade.stopBox, strategyTrade.entryPrice)
+                    box.set_bottom(strategyTrade.stopBox, strategyTrade.entryPrice)
+        // ── exits — BE-armed stop-outs record 0R; losses only from the original stop ──
+        if strategyTrade.direction == DIRECTION_LONG
+            if low <= strategyTrade.stopPrice
+                stillOpen         := false
+                realisedRMultiple := strategyTrade.beArmed ? 0.0 : -1.0
+            else if high >= strategyTrade.targetPrice
+                stillOpen         := false
+                realisedRMultiple := riskDistance > 0 ? (strategyTrade.targetPrice - strategyTrade.entryPrice) / riskDistance : 0.0
+        else
+            if high >= strategyTrade.stopPrice
+                stillOpen         := false
+                realisedRMultiple := strategyTrade.beArmed ? 0.0 : -1.0
+            else if low <= strategyTrade.targetPrice
+                stillOpen         := false
+                realisedRMultiple := riskDistance > 0 ? (strategyTrade.entryPrice - strategyTrade.targetPrice) / riskDistance : 0.0
+    [stillOpen, realisedRMultiple]
+
+// SL/TP zone box (force_overlay carried from CHARLIE; harmless on an overlay script)
+zoneBox(float topPrice, float bottomPrice, color zoneColor) =>
+    box.new(time, topPrice, time, bottomPrice, bgcolor = color.new(zoneColor, 80), border_color = color.new(zoneColor, 60), xloc = xloc.bar_time, force_overlay = true)
+
+// rolling trade-box history — cap so old SL/TP boxes are reclaimed
+var array<box> tradeBoxHistory = array.new<box>()
+trackTradeBox(box newBox) =>
+    if not na(newBox)
+        array.push(tradeBoxHistory, newBox)
+        while array.size(tradeBoxHistory) > 160
+            box oldestBox = array.shift(tradeBoxHistory)
+            if not na(oldestBox)
+                box.delete(oldestBox)
+    int(na)
+
+// the two independent trackers
+var StrategyTrade sqrcTrade = StrategyTrade.new()
+var StrategyTrade sqrrTrade = StrategyTrade.new()
+
+// per-engine single-position gates (independent; SQRC and SQRR don't block each other)
+sqrcEntryAllowed() => not blockNewEntriesWhileTradeOpen or not sqrcTrade.open
+sqrrEntryAllowed() => not blockNewEntriesWhileTradeOpen or not sqrrTrade.open
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FA_1: SQRC — Stoch Quad Rotation Continuation (deferred completion of SQRR)
+// ───────────────────────────────────────────────────────────────────────────
+//   SQRC no longer runs its own rotation machine. SQRR's rotation machine does
+//   all the work (G1 sweep → G2 quad latch → G3 counter-BOS → D-cross); on a bar
+//   where the D-cross FIRES but the swing validation FAILS (mistimed vs the swing
+//   engine), the rotation is captured here as SQRC's PENDING — direction + that
+//   bar's wick extreme. SQRR's latch is NOT touched by the handoff: it keeps
+//   waiting exactly as before, so SQRR firing behaviour is unchanged. The two
+//   engines remain FULLY INDEPENDENT — one rotation may legitimately produce
+//   BOTH an SQRR fire (a later bar validates) and an SQRC fire (dual fire),
+//   bounded by the one-position-per-engine locks.
+//
+//   DECISION: the next side-relevant CONFIRMED swing (ENG_1b) resolves the
+//   pending, one-shot, strictly after the handoff bar. LONG pending → next
+//   confirmed swing LOW:
+//     above the pending level → higher low → CONTINUATION → FIRE (entry = the
+//       confirmation bar's close; STOP = per-asset fixed %; the pending level
+//       is validation only; fixed-R target inline).
+//     at/below → the rotation failed → pending dies.
+//     continuation but killzone/bias/position blocked → the swing still DECIDES:
+//       pending consumed, opportunity missed.
+//   SHORT mirrors with the next confirmed swing HIGH / lower high.
+//   Latest handoff REPLACES an unresolved pending.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══ FILTERS ═════════════════════════════════════════════════════════════════
+// Bar-level permission: killzone open (container+quarter) and not blackout.
+bool sqrcKillzoneOpen = not tradeBlackout() and (not killzoneConfig.restrictEnabled or ammo.isKillzoneOpen(killzoneConfig.activeHours, hourLocal, quarterIndex))
+// OPTIONAL scalp-bias agreement (continuation: long wants BULLISH, short BEARISH; off → pass-through)
+bool sqrcBiasAllowsLong  = not sqrcBiasFilterEnabled or biasVerdict.ratifiedBiasId == ammo.BIAS_BULLISH
+bool sqrcBiasAllowsShort = not sqrcBiasFilterEnabled or biasVerdict.ratifiedBiasId == ammo.BIAS_BEARISH
+
+// ═══ SETUP CONTEXT — 90m session-quarter accumulator ═════════════════════════
+// LIVE: SQRR's swing-in-quarter validation reads sqrcQuarter.startBar.
+var ammo.PeriodOHLC sqrcQuarter = ammo.PeriodOHLC.new()
+int sqrcQuarterKey = containerIndex * 10 + quarterIndex
+ammo.advancePeriod(sqrcQuarter, sqrcQuarterKey, bar_index, open, high, low, close)
+
+// ═══ OPEN-TRADE MANAGEMENT — resolve live SQRC trade, tally ══════════════════
+var int   sqrcWinCount       = 0
+var int   sqrcLossCount      = 0
+var int   sqrcBreakevenCount = 0
+var float sqrcNetRMultiple   = 0.0
+[sqrcStillOpen, sqrcRealisedR] = resolveStrategyTrade(sqrcTrade)
+sqrcTrade.open := sqrcStillOpen
+if not na(sqrcRealisedR)
+    sqrcWinCount       += sqrcRealisedR > 0 ? 1 : 0
+    sqrcLossCount      += sqrcRealisedR < 0 ? 1 : 0
+    sqrcBreakevenCount += sqrcRealisedR == 0 ? 1 : 0
+    sqrcNetRMultiple   += sqrcRealisedR
+if sqrcTrade.open and not na(sqrcTrade.stopBox)
+    box.set_right(sqrcTrade.stopBox, time)
+    box.set_right(sqrcTrade.targetBox, time)
+
+// ═══ SETUP SEQUENCE — fire flags this bar ════════════════════════════════════
+bool  sqrcLong  = false
+bool  sqrcShort = false
+float sqrcEntryPrice  = na
+float sqrcStopPrice   = na
+float sqrcTargetPrice = na
+string sqrcEntryTag   = "DEC"    // "DEC" deferred swing decision · "L1"/"S1" handoff-bar entry
+
+// ── PENDING slot — set by the SQRR handoff (see FA_2 Stage 3) ──
+// One slot, latest handoff replaces any unresolved pending. Direction is the
+// SAME the rotation implied (oversold rotation → LONG). Level = the handoff
+// bar's wick extreme — the pivot-in-waiting and the future STOP.
+var int   sqrcPendingDirection = DIRECTION_NONE
+var float sqrcPendingLevel     = na
+var int   sqrcPendingBar       = na
+
+// ── DECISION — the next side-relevant CONFIRMED swing resolves the pending ──
+// One-shot: the first swing LOW confirmed strictly after the handoff bar decides
+// a LONG pending (swing HIGH for SHORT); opposite-side swings are ignored.
+//   swing above the pending level → continuation confirmed → FIRE (entry = this
+//     bar's close; STOP = per-asset fixed %; fixed-R target inline).
+//   at/below → not continuation → pending dies.
+//   continuation but killzone/bias/position blocks → opportunity missed, pending
+//     consumed (the swing DECIDES either way).
+if sqrcEnabled and not tradeBlackout() and barstate.isconfirmed
+    // LONG pending — decider = a swing whose PIVOT BAR printed after the handoff
+    // (lastSwingLowBar, not the confirmation bar: the rotation's own low prints
+    // just before the handoff and confirms `length` bars later — it must be
+    // ignored, not treated as the decider). close > pendingLevel is required
+    // because the pending level IS the stop: entry must sit above it.
+    if sqrcPendingDirection == DIRECTION_LONG and swingState.newSwingLow and swingState.lastSwingLowBar > sqrcPendingBar
+        bool sqrcLongContinuation = not na(sqrcPendingLevel) and swingState.lastSwingLow > sqrcPendingLevel and close > sqrcPendingLevel
+        if sqrcEntryDec and sqrcLongContinuation and sqrcKillzoneOpen and sqrcBiasAllowsLong and sqrcEntryAllowed()
+            float stopLevel    = close - fixedStopDistance   // per-asset FIXED stop; pending level is validation only
+            float riskDistance = fixedStopDistance
+            if not na(stopLevel) and riskDistance > 0
+                sqrcEntryPrice  := close
+                sqrcStopPrice   := stopLevel
+                sqrcTargetPrice := close + riskDistance * sqrcTargetRMultiple
+                sqrcLong        := true
+        // decision debug: consumed WITHOUT firing → why (X = continuation failed,
+        // BLK = continuation valid but killzone/bias/lock/DEC-toggle blocked)
+        if sqrcShowGateMarkers and not sqrcLong
+            label.new(bar_index, low, sqrcLongContinuation ? "C·DEC·BLK" : "C·DEC·X", xloc = xloc.bar_index, yloc = yloc.belowbar, style = label.style_label_up, color = sqrcGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+        sqrcPendingDirection := DIRECTION_NONE
+        sqrcPendingLevel     := na
+        sqrcPendingBar       := na
+    // SHORT pending — mirror: decider pivot must PRINT after the handoff.
+    if sqrcPendingDirection == DIRECTION_SHORT and swingState.newSwingHigh and swingState.lastSwingHighBar > sqrcPendingBar
+        bool sqrcShortContinuation = not na(sqrcPendingLevel) and swingState.lastSwingHigh < sqrcPendingLevel and close < sqrcPendingLevel
+        if sqrcEntryDec and sqrcShortContinuation and sqrcKillzoneOpen and sqrcBiasAllowsShort and sqrcEntryAllowed()
+            float stopLevel    = close + fixedStopDistance   // per-asset FIXED stop; pending level is validation only
+            float riskDistance = fixedStopDistance
+            if not na(stopLevel) and riskDistance > 0
+                sqrcEntryPrice  := close
+                sqrcStopPrice   := stopLevel
+                sqrcTargetPrice := close - riskDistance * sqrcTargetRMultiple
+                sqrcShort       := true
+        // decision debug (mirror): consumed WITHOUT firing → X / BLK
+        if sqrcShowGateMarkers and not sqrcShort
+            label.new(bar_index, high, sqrcShortContinuation ? "C·DEC·BLK" : "C·DEC·X", xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_down, color = sqrcGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+        sqrcPendingDirection := DIRECTION_NONE
+        sqrcPendingLevel     := na
+        sqrcPendingBar       := na
+
+// NOTE: SQRC's VALIDATED ENTRY block and signal plotshapes are RELOCATED below
+// FA_2 — the SQRC-L1/S1 immediate entry fires inside FA_2's handoff, so the
+// tracker/plots must evaluate after it. Same-bar behaviour of the deferred
+// decision path is unchanged by the move.
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FA_2: SQRR — Stoch Quad Rotation Reversal (6h container anchor)
+// ───────────────────────────────────────────────────────────────────────────
+//   Stages, in order:  FILTERS → SETUP (G1) → VALIDATION (G2, G3) → ENTRY TRIGGER → STOP/TARGET
+//
+//   Reversal model, trades AGAINST the scalp bias. Two independent machines
+//   (LONG / SHORT), each a 4-stage latch that fires SAME-BAR on the trigger.
+//
+//   STAGE MACHINE (per side, advances on CONFIRMED bars):
+//     Stage 0 — idle. Gate 1 (prev-6h-container sweep, toggle) arms → Stage 1.
+//     Stage 1 — await Gate 2: ALL FOUR stochs at the extreme → LATCH → Stage 2.
+//               The 90m-quarter sequence at latch is captured as the G3 anchor.
+//     Stage 2 — await Gate 3: a COUNTER-direction BOS within the G3 window
+//               (gate3WindowQuarters of the latch) → Stage 3. If the window
+//               lapses with no BOS, the setup dies. Gate 3 auto-passes if off.
+//     Stage 3 — trigger-ready. D9 (or D14) crosses back out of the extreme AND
+//               validation passes → FIRE. The latch SURVIVES a validation-fail;
+//               consumed only on fire, geometry-reject, or 6h-container roll.
+//
+//   Gate 3 polarity: a LONG reversal wants a BEARISH break (bearishStructureBreak);
+//   a SHORT wants bullishStructureBreak. VALIDATION = quad latch + Gate 3 + SWING
+//   (trigger bar treated as the pivot: local HL long / LH short vs the last
+//   CONFIRMED ENG_1b swing, which must sit inside the current 90m quarter) +
+//   OPTIONAL scalp-bias OPPOSITION (BEARISH long / BULLISH short; off → pass-through).
+//   STOP = per-asset FIXED % of price (fixedStopPercent in RiskConfig);
+//   target = fixed-R off that distance, computed inline.
+//   HANDOFF (non-destructive): on a bar where the D-cross fires but the swing
+//   validation fails, the rotation is captured as SQRC's PENDING (FA_1). The
+//   SQRR latch is NOT touched by this — SQRR firing behaviour is unchanged.
+//   This machine runs when EITHER engine is enabled; fires require sqrrEnabled.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══ FILTERS ═════════════════════════════════════════════════════════════════
+bool sqrrKillzoneOpen = not tradeBlackout() and (not killzoneConfig.restrictEnabled or ammo.isKillzoneOpen(killzoneConfig.activeHours, hourLocal, quarterIndex))
+// OPTIONAL scalp-bias OPPOSITION (reversal: long wants BEARISH, short BULLISH; off → pass-through)
+bool sqrrBiasAllowsLong  = not sqrrBiasFilterEnabled or biasVerdict.ratifiedBiasId == ammo.BIAS_BEARISH
+bool sqrrBiasAllowsShort = not sqrrBiasFilterEnabled or biasVerdict.ratifiedBiasId == ammo.BIAS_BULLISH
+
+// ═══ SETUP CONTEXT — 6h container accumulator ═════════════════════════════════
+// LIVE: Gate 1's sweep primitives read the prior container's closed extremes.
+// The swing engine (ENG_1b) is consumed at Stage 3 as LOOKBACK VALIDATION only:
+// the trigger bar must print a local HL (long) / LH (short) vs the last confirmed
+// swing, with that swing's pivot sitting INSIDE the current 90m quarter.
+var ammo.PeriodOHLC sqrrContainer = ammo.PeriodOHLC.new()
+int sqrrContainerKey = containerIndex
+ammo.advancePeriod(sqrrContainer, sqrrContainerKey, bar_index, open, high, low, close)
+
+// ═══ Gate 1 sweep primitives (prev 6h container; directional) ════════════════
+bool sqrrSweepPrevContainerLow  = not na(sqrrContainer.closedLow)  and low  < sqrrContainer.closedLow     // LONG  G1
+bool sqrrSweepPrevContainerHigh = not na(sqrrContainer.closedHigh) and high > sqrrContainer.closedHigh    // SHORT G1
+
+// ═══ OPEN-TRADE MANAGEMENT — resolve live SQRR trade, tally ══════════════════
+var int   sqrrWinCount       = 0
+var int   sqrrLossCount      = 0
+var int   sqrrBreakevenCount = 0
+var float sqrrNetRMultiple   = 0.0
+[sqrrStillOpen, sqrrRealisedR] = resolveStrategyTrade(sqrrTrade)
+sqrrTrade.open := sqrrStillOpen
+if not na(sqrrRealisedR)
+    sqrrWinCount       += sqrrRealisedR > 0 ? 1 : 0
+    sqrrLossCount      += sqrrRealisedR < 0 ? 1 : 0
+    sqrrBreakevenCount += sqrrRealisedR == 0 ? 1 : 0
+    sqrrNetRMultiple   += sqrrRealisedR
+if sqrrTrade.open and not na(sqrrTrade.stopBox)
+    box.set_right(sqrrTrade.stopBox, time)
+    box.set_right(sqrrTrade.targetBox, time)
+
+// ═══ SETUP SEQUENCE — fire flags this bar ════════════════════════════════════
+bool  sqrrLong  = false
+bool  sqrrShort = false
+float sqrrEntryPrice  = na
+float sqrrStopPrice   = na
+float sqrrTargetPrice = na
+string sqrrEntryTag   = "TRIG"   // "TRIG" D-cross entry · "L1"/"S1" sweep · "L2"/"S2" latch · "L3"/"S3" counter-BOS
+
+// ── LONG machine ──
+var int  sqrrLongStage     = 0
+var int  sqrrLongContainer  = na   // 6h container the setup is bound to
+var int  sqrrLongLatchSeq   = na   // quarterSequence when Gate 2 latched (G3 window anchor)
+var int  sqrrLongFiredCont  = na   // container of the last fire (one-shot lockout)
+var bool sqrrLongTrigSeen   = false
+
+// Rotation machine runs when EITHER engine is enabled (SQRC-only assets still
+// detect rotations for the handoff); SQRR FIRES additionally require sqrrEnabled.
+// On SQRR-enabled assets this is behaviour-identical to before.
+if (sqrrEnabled or sqrcEnabled) and not tradeBlackout() and barstate.isconfirmed
+    // container-roll death
+    if sqrrLongStage >= 1 and not na(sqrrLongContainer) and sqrrContainerKey != sqrrLongContainer
+        sqrrLongStage     := 0
+        sqrrLongContainer := na
+        sqrrLongLatchSeq  := na
+        sqrrLongTrigSeen  := false
+    // Gate 3 window lapse: latched but no counter-BOS within the window → die
+    if sqrrLongStage == 2 and sqrrGate3Enabled and not na(sqrrLongLatchSeq) and quarterSequence - sqrrLongLatchSeq > sqrrGate3WindowQuarters
+        sqrrLongStage     := 0
+        sqrrLongContainer := na
+        sqrrLongLatchSeq  := na
+        sqrrLongTrigSeen  := false
+    // Stage 0 → 1 · GATE 1 (prev-container LOW sweep; auto-pass if off)
+    if sqrrLongStage == 0 and (na(sqrrLongFiredCont) or sqrrLongFiredCont != sqrrContainerKey)
+        if not sqrrGate1Enabled
+            sqrrLongStage     := 1
+            sqrrLongContainer := sqrrContainerKey
+            sqrrLongTrigSeen  := false
+        else if sqrrSweepPrevContainerLow
+            sqrrLongStage     := 1
+            sqrrLongContainer := sqrrContainerKey
+            sqrrLongTrigSeen  := false
+            if sqrrShowGateMarkers
+                label.new(bar_index, low, "R·G1·L", xloc = xloc.bar_index, yloc = yloc.belowbar, style = label.style_label_up, color = sqrrGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+            // SQRR-L1 · staged entry on the sweep bar (fixed % stop; machine unaffected)
+            if sqrrEntryL1 and sqrrEnabled and sqrrKillzoneOpen and sqrrBiasAllowsLong and sqrrEntryAllowed()
+                float stagedStopDistance = fixedStopDistance
+                sqrrEntryPrice  := close
+                sqrrStopPrice   := close - stagedStopDistance
+                sqrrTargetPrice := close + stagedStopDistance * sqrrTargetRMultiple
+                sqrrLong        := true
+                sqrrEntryTag    := "L1"
+    // Stage 1 → 2 · GATE 2 (quad-stoch latch) — capture G3 window anchor
+    if sqrrLongStage == 1 and stochQuadAllOversold
+        sqrrLongStage    := 2
+        sqrrLongLatchSeq := quarterSequence
+        sqrrLongTrigSeen := false
+        if sqrrShowGateMarkers
+            label.new(bar_index, low, "R·G2▲", xloc = xloc.bar_index, yloc = yloc.belowbar, style = label.style_label_up, color = sqrrGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+        // SQRR-L2 · staged entry on the quad-latch bar (fixed % stop; machine unaffected)
+        if sqrrEntryL2 and sqrrEnabled and sqrrKillzoneOpen and sqrrBiasAllowsLong and sqrrEntryAllowed()
+            float stagedStopDistance = fixedStopDistance
+            sqrrEntryPrice  := close
+            sqrrStopPrice   := close - stagedStopDistance
+            sqrrTargetPrice := close + stagedStopDistance * sqrrTargetRMultiple
+            sqrrLong        := true
+            sqrrEntryTag    := "L2"
+    // Stage 2 → 3 · GATE 3 (counter-direction BOS within window; auto-pass if off)
+    if sqrrLongStage == 2
+        if not sqrrGate3Enabled
+            sqrrLongStage    := 3
+            sqrrLongTrigSeen := false
+        else if bearishStructureBreak and not na(sqrrLongLatchSeq) and quarterSequence - sqrrLongLatchSeq <= sqrrGate3WindowQuarters
+            sqrrLongStage    := 3
+            sqrrLongTrigSeen := false
+            if sqrrShowGateMarkers
+                label.new(bar_index, low, "R·G3·L", xloc = xloc.bar_index, yloc = yloc.belowbar, style = label.style_label_up, color = sqrrGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+            // SQRR-L3 · staged entry on the counter-BOS bar (fixed % stop; machine unaffected)
+            if sqrrEntryL3 and sqrrEnabled and sqrrKillzoneOpen and sqrrBiasAllowsLong and sqrrEntryAllowed()
+                float stagedStopDistance = fixedStopDistance
+                sqrrEntryPrice  := close
+                sqrrStopPrice   := close - stagedStopDistance
+                sqrrTargetPrice := close + stagedStopDistance * sqrrTargetRMultiple
+                sqrrLong        := true
+                sqrrEntryTag    := "L3"
+    // Stage 3 · TRIGGER + VALIDATION (latch survives a validation-fail)
+    if sqrrLongStage == 3
+        bool sqrrLongTrigger = (sqrrTrigMode == "Ultra Fast" and triggerUltraFastCrossUp) or (sqrrTrigMode == "Fast" and triggerFastCrossUp)
+        if sqrrLongTrigger
+            sqrrLongTrigSeen := true
+        // swing validation: the trigger bar IS the pivot; the last CONFIRMED swing
+        // (ENG_1b lookback) must sit inside the current 90m quarter (sqrcQuarter is
+        // the shared session-quarter accumulator, advanced unconditionally at top
+        // level) and the trigger bar's low must print a local HIGHER LOW above it.
+        // A swing-validation fail leaves the latch waiting (same as killzone/bias).
+        bool sqrrLongSwingValid = not na(swingState.lastSwingLow) and swingState.lastSwingLowBar >= sqrcQuarter.startBar and low > swingState.lastSwingLow
+        // HANDOFF (non-destructive): the D-cross fired THIS bar but the swing
+        // validation failed → capture the rotation as SQRC's PENDING (latest
+        // replaces). The SQRR latch is NOT touched — it keeps waiting exactly as
+        // before, so SQRR firing behaviour is UNCHANGED. Dual fire is allowed:
+        // the engines stay fully independent, bounded by their per-engine locks.
+        if sqrcEnabled and sqrrLongTrigger and not sqrrLongSwingValid
+            if sqrcEntryL1
+                // SQRC-L1 · immediate entry on the handoff bar (replaces the deferred
+                // decision while the toggle is on). Gates blocked → fire missed, no pending.
+                if sqrcKillzoneOpen and sqrcBiasAllowsLong and sqrcEntryAllowed()
+                    float stagedStopDistance = fixedStopDistance
+                    sqrcEntryPrice  := close
+                    sqrcStopPrice   := close - stagedStopDistance
+                    sqrcTargetPrice := close + stagedStopDistance * sqrcTargetRMultiple
+                    sqrcLong        := true
+                    sqrcEntryTag    := "L1"
+            else
+                sqrcPendingDirection := DIRECTION_LONG
+                sqrcPendingLevel     := low
+                sqrcPendingBar       := bar_index
+                if sqrcShowGateMarkers
+                    label.new(bar_index, low, "C·PEND·L", xloc = xloc.bar_index, yloc = yloc.belowbar, style = label.style_label_up, color = sqrcGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+        bool sqrrLongValid  = sqrrEntryTrig and sqrrEnabled and sqrrLongTrigSeen and sqrrLongSwingValid and sqrrKillzoneOpen and sqrrBiasAllowsLong and sqrrEntryAllowed()
+        if sqrrLongValid
+            // stop = per-asset FIXED %; fixed-R target inline
+            float stopLevel    = close - fixedStopDistance
+            float riskDistance = fixedStopDistance
+            bool  entryValid   = not na(stopLevel) and riskDistance > 0
+            if entryValid
+                sqrrEntryPrice  := close
+                sqrrStopPrice   := stopLevel
+                sqrrTargetPrice := close + riskDistance * sqrrTargetRMultiple
+                sqrrLong        := true
+            sqrrLongFiredCont := sqrrContainerKey
+            sqrrLongStage     := 0
+            sqrrLongContainer := na
+            sqrrLongLatchSeq  := na
+            sqrrLongTrigSeen  := false
+
+// ── SHORT machine ──
+var int  sqrrShortStage     = 0
+var int  sqrrShortContainer  = na
+var int  sqrrShortLatchSeq   = na
+var int  sqrrShortFiredCont  = na
+var bool sqrrShortTrigSeen   = false
+
+if (sqrrEnabled or sqrcEnabled) and not tradeBlackout() and barstate.isconfirmed
+    if sqrrShortStage >= 1 and not na(sqrrShortContainer) and sqrrContainerKey != sqrrShortContainer
+        sqrrShortStage     := 0
+        sqrrShortContainer := na
+        sqrrShortLatchSeq  := na
+        sqrrShortTrigSeen  := false
+    if sqrrShortStage == 2 and sqrrGate3Enabled and not na(sqrrShortLatchSeq) and quarterSequence - sqrrShortLatchSeq > sqrrGate3WindowQuarters
+        sqrrShortStage     := 0
+        sqrrShortContainer := na
+        sqrrShortLatchSeq  := na
+        sqrrShortTrigSeen  := false
+    if sqrrShortStage == 0 and (na(sqrrShortFiredCont) or sqrrShortFiredCont != sqrrContainerKey)
+        if not sqrrGate1Enabled
+            sqrrShortStage     := 1
+            sqrrShortContainer := sqrrContainerKey
+            sqrrShortTrigSeen  := false
+        else if sqrrSweepPrevContainerHigh
+            sqrrShortStage     := 1
+            sqrrShortContainer := sqrrContainerKey
+            sqrrShortTrigSeen  := false
+            if sqrrShowGateMarkers
+                label.new(bar_index, high, "R·G1·S", xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_down, color = sqrrGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+            // SQRR-S1 · staged entry on the sweep bar (fixed % stop; machine unaffected)
+            if sqrrEntryL1 and sqrrEnabled and sqrrKillzoneOpen and sqrrBiasAllowsShort and sqrrEntryAllowed()
+                float stagedStopDistance = fixedStopDistance
+                sqrrEntryPrice  := close
+                sqrrStopPrice   := close + stagedStopDistance
+                sqrrTargetPrice := close - stagedStopDistance * sqrrTargetRMultiple
+                sqrrShort       := true
+                sqrrEntryTag    := "S1"
+    if sqrrShortStage == 1 and stochQuadAllOverbought
+        sqrrShortStage    := 2
+        sqrrShortLatchSeq := quarterSequence
+        sqrrShortTrigSeen := false
+        if sqrrShowGateMarkers
+            label.new(bar_index, high, "R·G2▼", xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_down, color = sqrrGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+        // SQRR-S2 · staged entry on the quad-latch bar (fixed % stop; machine unaffected)
+        if sqrrEntryL2 and sqrrEnabled and sqrrKillzoneOpen and sqrrBiasAllowsShort and sqrrEntryAllowed()
+            float stagedStopDistance = fixedStopDistance
+            sqrrEntryPrice  := close
+            sqrrStopPrice   := close + stagedStopDistance
+            sqrrTargetPrice := close - stagedStopDistance * sqrrTargetRMultiple
+            sqrrShort       := true
+            sqrrEntryTag    := "S2"
+    if sqrrShortStage == 2
+        if not sqrrGate3Enabled
+            sqrrShortStage    := 3
+            sqrrShortTrigSeen := false
+        else if bullishStructureBreak and not na(sqrrShortLatchSeq) and quarterSequence - sqrrShortLatchSeq <= sqrrGate3WindowQuarters
+            sqrrShortStage    := 3
+            sqrrShortTrigSeen := false
+            if sqrrShowGateMarkers
+                label.new(bar_index, high, "R·G3·S", xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_down, color = sqrrGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+            // SQRR-S3 · staged entry on the counter-BOS bar (fixed % stop; machine unaffected)
+            if sqrrEntryL3 and sqrrEnabled and sqrrKillzoneOpen and sqrrBiasAllowsShort and sqrrEntryAllowed()
+                float stagedStopDistance = fixedStopDistance
+                sqrrEntryPrice  := close
+                sqrrStopPrice   := close + stagedStopDistance
+                sqrrTargetPrice := close - stagedStopDistance * sqrrTargetRMultiple
+                sqrrShort       := true
+                sqrrEntryTag    := "S3"
+    if sqrrShortStage == 3
+        bool sqrrShortTrigger = (sqrrTrigMode == "Ultra Fast" and triggerUltraFastCrossDown) or (sqrrTrigMode == "Fast" and triggerFastCrossDown)
+        if sqrrShortTrigger
+            sqrrShortTrigSeen := true
+        // swing validation (mirror): trigger bar IS the pivot; last CONFIRMED swing
+        // must sit inside the current 90m quarter and the trigger bar's high must
+        // print a local LOWER HIGH below it. Fail → latch waits.
+        bool sqrrShortSwingValid = not na(swingState.lastSwingHigh) and swingState.lastSwingHighBar >= sqrcQuarter.startBar and high < swingState.lastSwingHigh
+        // HANDOFF (mirror, non-destructive): latch untouched; pending captured.
+        if sqrcEnabled and sqrrShortTrigger and not sqrrShortSwingValid
+            if sqrcEntryL1
+                // SQRC-S1 · immediate entry on the handoff bar (mirror).
+                if sqrcKillzoneOpen and sqrcBiasAllowsShort and sqrcEntryAllowed()
+                    float stagedStopDistance = fixedStopDistance
+                    sqrcEntryPrice  := close
+                    sqrcStopPrice   := close + stagedStopDistance
+                    sqrcTargetPrice := close - stagedStopDistance * sqrcTargetRMultiple
+                    sqrcShort       := true
+                    sqrcEntryTag    := "S1"
+            else
+                sqrcPendingDirection := DIRECTION_SHORT
+                sqrcPendingLevel     := high
+                sqrcPendingBar       := bar_index
+                if sqrcShowGateMarkers
+                    label.new(bar_index, high, "C·PEND·S", xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_down, color = sqrcGateMarkerColor, textcolor = color.white, size = size.tiny, force_overlay = true)
+        bool sqrrShortValid  = sqrrEntryTrig and sqrrEnabled and sqrrShortTrigSeen and sqrrShortSwingValid and sqrrKillzoneOpen and sqrrBiasAllowsShort and sqrrEntryAllowed()
+        if sqrrShortValid
+            // stop = per-asset FIXED %; fixed-R target inline
+            float stopLevel    = close + fixedStopDistance
+            float riskDistance = fixedStopDistance
+            bool  entryValid   = not na(stopLevel) and riskDistance > 0
+            if entryValid
+                sqrrEntryPrice  := close
+                sqrrStopPrice   := stopLevel
+                sqrrTargetPrice := close - riskDistance * sqrrTargetRMultiple
+                sqrrShort       := true
+            sqrrShortFiredCont := sqrrContainerKey
+            sqrrShortStage     := 0
+            sqrrShortContainer := na
+            sqrrShortLatchSeq  := na
+            sqrrShortTrigSeen  := false
+
+// ═══ VALIDATED ENTRY — open the tracker, draw zone boxes ═════════════════════
+if (sqrrLong or sqrrShort) and not sqrrTrade.open and not na(sqrrStopPrice) and not na(sqrrTargetPrice)
+    sqrrTrade.direction   := sqrrLong ? DIRECTION_LONG : DIRECTION_SHORT
+    sqrrTrade.entryPrice  := sqrrEntryPrice
+    sqrrTrade.stopPrice   := sqrrStopPrice
+    sqrrTrade.targetPrice := sqrrTargetPrice
+    sqrrTrade.initialRisk := math.abs(sqrrEntryPrice - sqrrStopPrice)
+    sqrrTrade.beArmed     := false
+    sqrrTrade.open        := true
+    if showTradeZoneBoxes
+        sqrrTrade.stopBox   := sqrrLong ? zoneBox(sqrrEntryPrice, sqrrStopPrice, color.red) : zoneBox(sqrrStopPrice, sqrrEntryPrice, color.red)
+        sqrrTrade.targetBox := sqrrLong ? zoneBox(sqrrTargetPrice, sqrrEntryPrice, color.green) : zoneBox(sqrrEntryPrice, sqrrTargetPrice, color.green)
+        trackTradeBox(sqrrTrade.stopBox)
+        trackTradeBox(sqrrTrade.targetBox)
+
+// ═══ SIGNAL MARKERS ══════════════════════════════════════════════════════════
+plotshape(sqrrLong,  "SQRR Long",  style = shape.triangleup,   location = location.belowbar, color = sqrrSignalColor, size = size.small, text = "L (SQRR)", textcolor = color.white, force_overlay = true)
+plotshape(sqrrShort, "SQRR Short", style = shape.triangledown, location = location.abovebar, color = sqrrSignalColor, size = size.small, text = "S (SQRR)", textcolor = color.white, force_overlay = true)
+
+// ═══ VALIDATED ENTRY (SQRC, relocated from FA_1) — open the tracker, boxes ════
+// Runs after FA_2 so both SQRC entry paths are visible: the deferred swing
+// decision (set in FA_1) and the SQRC-L1/S1 handoff-bar entry (set in FA_2).
+if (sqrcLong or sqrcShort) and not sqrcTrade.open and not na(sqrcStopPrice) and not na(sqrcTargetPrice)
+    sqrcTrade.direction   := sqrcLong ? DIRECTION_LONG : DIRECTION_SHORT
+    sqrcTrade.entryPrice  := sqrcEntryPrice
+    sqrcTrade.stopPrice   := sqrcStopPrice
+    sqrcTrade.targetPrice := sqrcTargetPrice
+    sqrcTrade.initialRisk := math.abs(sqrcEntryPrice - sqrcStopPrice)
+    sqrcTrade.beArmed     := false
+    sqrcTrade.open        := true
+    if showTradeZoneBoxes
+        sqrcTrade.stopBox   := sqrcLong ? zoneBox(sqrcEntryPrice, sqrcStopPrice, color.red) : zoneBox(sqrcStopPrice, sqrcEntryPrice, color.red)
+        sqrcTrade.targetBox := sqrcLong ? zoneBox(sqrcTargetPrice, sqrcEntryPrice, color.green) : zoneBox(sqrcEntryPrice, sqrcTargetPrice, color.green)
+        trackTradeBox(sqrcTrade.stopBox)
+        trackTradeBox(sqrcTrade.targetBox)
+
+// ═══ SIGNAL MARKERS (SQRC, relocated) ════════════════════════════════════════
+plotshape(sqrcLong,  "SQRC Long",  style = shape.triangleup,   location = location.belowbar, color = sqrcSignalColor, size = size.small, text = "L (SQRC)", textcolor = color.white, force_overlay = true)
+plotshape(sqrcShort, "SQRC Short", style = shape.triangledown, location = location.abovebar, color = sqrcSignalColor, size = size.small, text = "S (SQRC)", textcolor = color.white, force_overlay = true)
+
+// ═══ STATS TABLE ═════════════════════════════════════════════════════════════
+var table statsTable = table.new(position.bottom_right, 2, 11, border_width = 1)
+statsRow(int rowIndex, string rowLabel, string rowValue, color valueColor) =>
+    table.cell(statsTable, 0, rowIndex, rowLabel, text_color = color.white, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_left)
+    table.cell(statsTable, 1, rowIndex, rowValue, text_color = valueColor, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_right)
+if showStatsTable and barstate.islast
+    color headerBackground = color.new(#1a237e, 20)
+    color profitColor      = color.new(#00e676, 0)
+    color highlightColor   = color.new(#ffeb3b, 0)
+    int   totalWins       = sqrcWinCount + sqrrWinCount
+    int   totalLosses     = sqrcLossCount + sqrrLossCount
+    int   totalBreakevens = sqrcBreakevenCount + sqrrBreakevenCount
+    int   totalTrades     = totalWins + totalLosses + totalBreakevens
+    int   decisiveTrades  = totalWins + totalLosses
+    float winRate         = decisiveTrades > 0 ? totalWins * 100.0 / decisiveTrades : 0.0
+    float netRMultiple  = sqrcNetRMultiple + sqrrNetRMultiple
+    float profitDollars = netRMultiple * riskDollarsPerR
+    table.cell(statsTable, 0, 0, "SNIPER_ALPHA — Stats", text_color = color.white, bgcolor = headerBackground, text_halign = text.align_left)
+    table.cell(statsTable, 1, 0, "", bgcolor = headerBackground)
+    statsRow(1,  "Total Trades", str.tostring(totalTrades), color.white)
+    statsRow(2,  "W / L / BE", str.tostring(totalWins) + " / " + str.tostring(totalLosses) + " / " + str.tostring(totalBreakevens), color.white)
+    statsRow(3,  "Win Rate (ex-BE)", str.tostring(winRate, "#.##") + "%", highlightColor)
+    statsRow(4,  "SQRC W/L/BE", str.tostring(sqrcWinCount) + " / " + str.tostring(sqrcLossCount) + " / " + str.tostring(sqrcBreakevenCount), color.white)
+    statsRow(5,  "SQRR W/L/BE", str.tostring(sqrrWinCount) + " / " + str.tostring(sqrrLossCount) + " / " + str.tostring(sqrrBreakevenCount), color.white)
+    statsRow(6,  "Profit ($ / R)", "$" + str.tostring(profitDollars, "#.##") + "  (" + str.tostring(netRMultiple, "#.#") + "R)", profitColor)
+    statsRow(7,  "Killzone", killzoneWindowName, color.white)
+    color sqrcLockColor = sqrcTrade.open ? color.new(#ff5252, 0) : color.new(#00e676, 0)
+    statsRow(8,  "SQRC Lock", blockNewEntriesWhileTradeOpen ? (sqrcTrade.open ? "LOCKED" : "CLEAR") : "OFF", sqrcLockColor)
+    color sqrrLockColor = sqrrTrade.open ? color.new(#ff5252, 0) : color.new(#00e676, 0)
+    statsRow(9,  "SQRR Lock", blockNewEntriesWhileTradeOpen ? (sqrrTrade.open ? "LOCKED" : "CLEAR") : "OFF", sqrrLockColor)
+    statsRow(10, "BE @ 0.5R", moveStopToBreakeven ? "ON" : "OFF", moveStopToBreakeven ? color.new(#00e676, 0) : color.gray)
+
+// ═══ LAST-SIGNAL TRACKING ════════════════════════════════════════════════════
+// Per-engine last fired signal (direction / price / time); shared formatter.
+var int   sqrcLastDirection = 0
+var float sqrcLastPrice     = na
+var int   sqrcLastTime      = na
+if sqrcLong or sqrcShort
+    sqrcLastDirection := sqrcLong ? DIRECTION_LONG : DIRECTION_SHORT
+    sqrcLastPrice     := sqrcEntryPrice
+    sqrcLastTime      := time
+
+var int   sqrrLastDirection = 0
+var float sqrrLastPrice     = na
+var int   sqrrLastTime      = na
+if sqrrLong or sqrrShort
+    sqrrLastDirection := sqrrLong ? DIRECTION_LONG : DIRECTION_SHORT
+    sqrrLastPrice     := sqrrEntryPrice
+    sqrrLastTime      := time
+
+formatLastSignal(int signalDirection, float signalPrice, int signalTime) =>
+    signalDirection == 0 or na(signalTime) ? "—" : (signalDirection == DIRECTION_LONG ? "LONG " : "SHORT ") + str.tostring(signalPrice, format.mintick) + " @ " + str.format_time(signalTime, "MMM-dd HH:mm", anchorTimezone)
+
+// ═══ UNIFIED DASHBOARD ═══════════════════════════════════════════════════════
+var table dashboardTable = table.new(position.top_right, 2, 7,
+     bgcolor = color.new(#1e222d, 0), border_color = #373a46, border_width = 1, frame_color = #373a46, frame_width = 1)
+dashboardRow(int rowIndex, string rowLabel, string rowValue, color valueColor) =>
+    table.cell(dashboardTable, 0, rowIndex, rowLabel, text_color = color.white, text_size = size.small, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_left)
+    table.cell(dashboardTable, 1, rowIndex, rowValue, text_color = valueColor, text_size = size.small, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_right)
+if showUnifiedDashboard and barstate.islast
+    table.cell(dashboardTable, 0, 0, "SNIPER_ALPHA — Panel", text_color = color.white, text_size = size.small, bgcolor = color.new(#1a237e, 20), text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Active", text_color = color.white, text_size = size.small, bgcolor = color.new(#1a237e, 20), text_halign = text.align_right)
+    dashboardRow(1, "Killzone", killzoneWindowName, color.white)
+    dashboardRow(2, "Phase", phaseLetter(quarterIndex), color.white)
+    dashboardRow(3, biasLabel, ammo.biasText(biasVerdict.ratifiedBiasId), ammo.biasColor(biasVerdict.ratifiedBiasId))
+    dashboardRow(4, "SQRC last", formatLastSignal(sqrcLastDirection, sqrcLastPrice, sqrcLastTime), sqrcLastDirection == DIRECTION_LONG ? color.new(#00e676, 0) : sqrcLastDirection == DIRECTION_SHORT ? color.new(#f23645, 0) : color.gray)
+    dashboardRow(5, "SQRR last", formatLastSignal(sqrrLastDirection, sqrrLastPrice, sqrrLastTime), sqrrLastDirection == DIRECTION_LONG ? color.new(#00e676, 0) : sqrrLastDirection == DIRECTION_SHORT ? color.new(#f23645, 0) : color.gray)
+    string sqrcPendText = not sqrcEnabled ? "ENGINE OFF" :
+         sqrcPendingDirection == DIRECTION_NONE ? "—" :
+         (sqrcPendingDirection == DIRECTION_LONG ? "LONG " : "SHORT ") + str.tostring(sqrcPendingLevel, format.mintick) + " (" + str.tostring(bar_index - sqrcPendingBar) + "b)"
+    dashboardRow(6, "SQRC pend", sqrcPendText, not sqrcEnabled ? color.new(#ff5252, 0) : sqrcPendingDirection == DIRECTION_LONG ? color.new(#00e676, 0) : sqrcPendingDirection == DIRECTION_SHORT ? color.new(#f23645, 0) : color.gray)
+
+// ═══ ALERTS ══════════════════════════════════════════════════════════════════
+// NOTE: alert path is untouched by the breakeven tracker. Payloads fire once at
+// entry with the ORIGINAL entry/SL/TP; the EA manages stops with its own logic.
+string schemaVersion    = "2.0.0"
+string providerName     = "tradingview"
+string chartType        = "Candle"
+string sqrcStrategyId   = "SA-SQRC-" + assetConfig.assetCode
+string sqrrStrategyId   = "SA-SQRR-" + assetConfig.assetCode
+string sqrcStrategyName = "SNIPER_ALPHA_SQRC"
+string sqrrStrategyName = "SNIPER_ALPHA_SQRR"
+string brokerSymbol     = str.length(brokerSymbolOverride) > 0 ? brokerSymbolOverride : syminfo.ticker
+
+// ── SQRC ──
+if sqrcLong and not na(sqrcTrade.stopPrice) and not na(sqrcTrade.targetPrice)
+    string signalId = sqrcStrategyId + "-L-" + sqrcEntryTag + "-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, sqrcStrategyId, sqrcStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "LONG", sqrcTrade.entryPrice, sqrcTrade.stopPrice, sqrcTrade.targetPrice, sqrcStrategyName + "-ENTRY-" + sqrcEntryTag + "-L")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+if sqrcShort and not na(sqrcTrade.stopPrice) and not na(sqrcTrade.targetPrice)
+    string signalId = sqrcStrategyId + "-S-" + sqrcEntryTag + "-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, sqrcStrategyId, sqrcStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "SHORT", sqrcTrade.entryPrice, sqrcTrade.stopPrice, sqrcTrade.targetPrice, sqrcStrategyName + "-ENTRY-" + sqrcEntryTag + "-S")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+// ── SQRR ──
+if sqrrLong and not na(sqrrTrade.stopPrice) and not na(sqrrTrade.targetPrice)
+    string signalId = sqrrStrategyId + "-L-" + sqrrEntryTag + "-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, sqrrStrategyId, sqrrStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "LONG", sqrrTrade.entryPrice, sqrrTrade.stopPrice, sqrrTrade.targetPrice, sqrrStrategyName + "-ENTRY-" + sqrrEntryTag + "-L")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+if sqrrShort and not na(sqrrTrade.stopPrice) and not na(sqrrTrade.targetPrice)
+    string signalId = sqrrStrategyId + "-S-" + sqrrEntryTag + "-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, sqrrStrategyId, sqrrStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "SHORT", sqrrTrade.entryPrice, sqrrTrade.stopPrice, sqrrTrade.targetPrice, sqrrStrategyName + "-ENTRY-" + sqrrEntryTag + "-S")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)

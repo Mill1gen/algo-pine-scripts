@@ -1,0 +1,917 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// SNIPER_DELTA — 1m execution layer
+// ───────────────────────────────────────────────────────────────────────────
+// Strategy: DEX (Doyle Exchange Model) — order-block rejection signal.
+//   A candle wicks into a drawn order block and closes back out of it; the
+//   trade enters on the CLOSE of the following bar. Single open position.
+// Engines are independent and run unconditionally; DEX gates off their outputs.
+//   Quarterly · Bias · Volume · Order Block · Trade Tracker
+// Library: Sniper_Ammo (structure BOS · order blocks · killzone resolver · bias · payload)
+// Tracker: breakeven @ 0.5R — stats/backtest only, NOT on the alert path.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("SNIPER_DELTA", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+import Wen_Rich/Sniper_Ammo/14 as ammo
+
+// ═══ CONSTANTS ═══════════════════════════════════════════════════════════════
+int DIRECTION_NONE  = 0
+int DIRECTION_LONG  = 1
+int DIRECTION_SHORT = -1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── General ──
+generalGroup = "General"
+anchorTimezone = input.string("Australia/Sydney", "Timezone",
+     options = ["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney", "UTC"],
+     group = generalGroup, tooltip = "Quarter math, sessions and the weekly anchor use this timezone.")
+historyLookbackDays = input.int(3, "History / lookback (days)", minval = 1, maxval = 7, group = generalGroup)
+
+// ── Execution / Routing ──
+routingGroup = "Execution / Routing"
+executionTarget = input.string("dc_exness_mt5_01", "Execution target (MT5 instance)",
+     options = ["dc_exness_mt5_01", "nexus_ftmo_mt5_01"], group = routingGroup, tooltip = "MT5 instance the webhook routes to.")
+brokerSymbolOverride = input.string("", "Broker symbol override", group = routingGroup,
+     tooltip = "Optional MT5/Exness symbol override. Leave blank to use the TradingView ticker.")
+blockNewEntriesWhileTradeOpen = input.bool(true, "Block new entries while any trade is open", group = routingGroup,
+     tooltip = "One active trade at a time. While a DEX trade is open, developing setups are cleared. Kept multi-strategy ready for future trend-following engines bolted into DELTA.")
+
+// ── Quarterly Anchor ──
+quarterlyAnchorGroup = "Quarterly Anchor Time"
+sessionAnchorStartHour = input.int(10, "S1 start hour (local time)", minval = 0, maxval = 23, group = quarterlyAnchorGroup,
+     tooltip = "Local hour the quarterly structure anchors from. The 1h containers and 15m quarters tile forward from here.")
+
+// ── Quarter Visuals ──
+quarterlyVisualsGroup = "Quarter Visuals"
+showHourContainerBox = input.bool(true, "Show 1h container box",  group = quarterlyVisualsGroup)
+showQuarterBoxes     = input.bool(true, "Show 15m quarter boxes", group = quarterlyVisualsGroup)
+showQuarterLabels    = input.bool(true, "Show A/M/D/C labels",    group = quarterlyVisualsGroup)
+accumulationColor    = input.color(color.new(#2962FF, 85), "A — Accumulation", group = quarterlyVisualsGroup)
+manipulationColor    = input.color(color.new(#E91E63, 85), "M — Manipulation", group = quarterlyVisualsGroup)
+distributionColor    = input.color(color.new(#26A69A, 85), "D — Distribution", group = quarterlyVisualsGroup)
+continuationColor    = input.color(color.new(#9E9E9E, 85), "C — Continuation", group = quarterlyVisualsGroup)
+
+// ── Structure Engine (library-fed SMC: internal BOS/MSB + order blocks) ──
+structureGroup = "Structure"
+internalPivotLength   = input.int(10, "Internal pivot length", minval = 1, group = structureGroup, tooltip = "ammo.run internalLen — lower = more/earlier breaks. Drives BOS/MSB + OB anchoring.")
+swingPivotLength      = input.int(50, "Swing pivot length", minval = 1, group = structureGroup, tooltip = "ammo.run swingLen — the reference an internal break must DIFFER from to validate. Always gates, even with confluence off.")
+structureConfluence   = input.bool(true,  "Confluence filter", group = structureGroup, tooltip = "ammo.run confluence — also require a body-position confluence bar. On = fewer, cleaner breaks.")
+structurePresentMode  = input.bool(false, "Present mode (reuse latest line)", group = structureGroup, tooltip = "ammo.run present — true reuses one structure line; false keeps each historical break line.")
+showStructureBreaks   = input.bool(true, "Draw structure breaks", group = structureGroup)
+bullishStructureColor = input.color(#089981, "Bullish colour", group = structureGroup)
+bearishStructureColor = input.color(#f23645, "Bearish colour", group = structureGroup)
+
+// ── Order Block Engine (library-fed via Sniper_Ammo SMC) ──
+orderBlockGroup = "Order Blocks"
+showOrderBlocks       = input.bool(true, "Show order blocks", group = orderBlockGroup)
+maxOrderBlocksKept    = input.int(5, "Max OBs kept / drawn", minval = 1, maxval = 20, group = orderBlockGroup,
+     tooltip = "Passed to the library SMC engine (run maxOB). ALSO bounds how many OBs DEX may trade — DEX only acts on the drawn set.")
+orderBlockFilter      = input.string("Atr", "OB volatility filter", options = ["Atr", "Cumulative Mean Range"], group = orderBlockGroup,
+     tooltip = "How the library anchors the OB candle. Atr = ATR(200); Cumulative Mean Range = running mean true range.")
+orderBlockMitigation  = input.string("High/Low", "OB mitigation", options = ["Close", "High/Low"], group = orderBlockGroup,
+     tooltip = "Close = OB dies only when price CLOSES through it. High/Low = a wick through removes it.")
+demandOrderBlockColor = input.color(color.new(#3179f5, 0), "Demand (bull) OB colour", group = orderBlockGroup)
+supplyOrderBlockColor = input.color(color.new(#f77c80, 0), "Supply (bear) OB colour", group = orderBlockGroup)
+
+// ── DEX Signal Colours ──
+dexColoursGroup = "DEX · Signal Colours"
+dexLongColor  = input.color(color.new(#42A5F5, 0), "DEX Long colour",  group = dexColoursGroup)
+dexShortColor = input.color(color.new(#FFB300, 0), "DEX Short colour", group = dexColoursGroup)
+
+// ── DEX Re-entry Guard ──
+// Without these, a stop-out returns the book to FLAT while the SAME order block
+// is still drawn — so the very next bar re-arms on the setup that just failed.
+// Three independent brakes, all checked at the arm.
+dexGuardGroup = "DEX · Re-entry Guard"
+dexBlockRetradedZone = input.bool(true, "Don't re-trade the same order block", group = dexGuardGroup,
+     tooltip = "ROOT FIX. A zone that has already produced a signal is retired — it can never produce another, however many times price returns to it. This is what stops the same OB firing two or three times in a row.")
+dexOneSignalPerQuarter = input.bool(true, "One signal per quarter", group = dexGuardGroup,
+     tooltip = "At most one DEX fill per 15m quarter, whichever zone it came from.")
+dexCooldownBars = input.int(15, "Cooldown after a signal (bars)", minval = 0, group = dexGuardGroup,
+     tooltip = "No new arm until this many 1m bars have passed since the last fill. 0 = off. Runs alongside the two guards above, not instead of them.")
+
+// ── Risk & Stats ──
+riskStatsGroup = "Risk & Stats"
+showTradeZoneBoxes = input.bool(true, "Show SL/TP zone boxes", group = riskStatsGroup)
+showStatsTable     = input.bool(true, "Show stats table",      group = riskStatsGroup)
+riskDollarsPerR    = input.float(50, "Risk per 1R ($, stats only)", minval = 1, group = riskStatsGroup)
+moveStopToBreakeven = input.bool(true, "Move stop to breakeven at 50% of stop distance", group = riskStatsGroup,
+     tooltip = "TRACKER ONLY — never touches alerts/EA. Once price moves 0.5R in favour, the tracked stop moves to entry and the trade runs to target. Exits at entry count as BE (0R), not a loss.")
+
+// ── Unified Dashboard ──
+dashboardGroup = "Unified Dashboard"
+showUnifiedDashboard = input.bool(true, "Show SNIPER_DELTA dashboard", group = dashboardGroup)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIG TYPES — the shape of an asset's configuration
+// ═══════════════════════════════════════════════════════════════════════════
+// Killzone schedule is HOST-HELD: a list of active CLOCK HOURS (ammo.KillzoneHour),
+// each carrying which quarters (A/M/D/C) trade in that hour. The library query
+// (ammo.isKillzoneOpen) reads the host's own hourLocal + quarterIndex — no separate
+// time math, so it can't drift from the container/quarter clock. ONE killzone per
+// asset, used by DEX (and any future DELTA strategy).
+type KillzoneConfig
+    bool   restrictEnabled
+    array<ammo.KillzoneHour> activeHours
+
+// Shared bias / volume settings.
+type SharedConfig
+    bool   volumeGateEnabled
+    float  volumeThreshold
+    int    biasConfirmCount
+
+// Shared risk band. DEX derives a structural stop level (swing or OB edge), then
+// this band gates it: a stop distance outside [min, max] % of entry → rejected.
+type RiskConfig
+    float  structuralStopMinPercent    // structural stop must sit at least this % from entry
+    float  structuralStopMaxPercent    // ...and at most this % — outside the band → rejected
+
+// DEX strategy.
+//   emaTrendEnabled  : OPTIONAL 200-EMA trend filter
+//   biasFilterEnabled: OPTIONAL ratified HTF quarter-bias filter
+//   stopSource       : "Swing" (last SMC swing) or "OB Zone Edge" (armed OB edge)
+//   riskRewardRatio  : target = this multiple of the stop distance
+type DexConfig
+    bool   enabled
+    bool   emaTrendEnabled
+    bool   biasFilterEnabled
+    string stopSource
+    float  riskRewardRatio
+
+type AssetConfig
+    string         assetCode
+    bool           isKnownAsset
+    SharedConfig   shared
+    RiskConfig     risk
+    KillzoneConfig killzone
+    DexConfig      dex
+
+// ── killzone helper ──────────────────────────────────────────────────────────
+// Continuation model: within each active hour, A is OFF and M/D/C are ON.
+// DEX arms in M or D (Q2/Q3); the fill lands the next bar in D or C — so the
+// killzone opens M/D/C to cover both the arm quarters (M/D) and the fill (D/C).
+continuationHour(int hourOfDay) =>
+    ammo.KillzoneHour.new(hourOfDay, true, true, true, true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PER-ASSET CONFIG — one self-contained block per asset (no base + override).
+// Each block spells out EVERYTHING that asset uses: stop band, DEX tuning, and
+// its killzone hours inline. Read one block top-to-bottom and you know exactly
+// how that asset trades.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── AUDUSD ──
+buildConfigAUDJPY() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()                                   // Asia
+    array.push(killzoneHours, continuationHour(9))
+    array.push(killzoneHours, continuationHour(10))
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(15))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(19))
+    array.push(killzoneHours, continuationHour(20))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    AssetConfig.new("AUDJPY", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 1),
+         RiskConfig.new(structuralStopMinPercent = 0.07, structuralStopMaxPercent = 0.10),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+buildConfigAUDUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()                                   // Asia
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(15))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(19))
+    array.push(killzoneHours, continuationHour(20))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    array.push(killzoneHours, continuationHour(6))
+    AssetConfig.new("AUDUSD", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         RiskConfig.new(structuralStopMinPercent = 0.06, structuralStopMaxPercent = 0.10),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+
+// ── BTC — also the fallback for unknown tickers ──
+buildConfigBTCUSD(string assetCode, bool isKnownAsset) =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    array.push(killzoneHours, continuationHour(1))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    AssetConfig.new(assetCode, isKnownAsset,
+         SharedConfig.new(volumeGateEnabled = false, volumeThreshold = 1.5, biasConfirmCount = 1),
+         RiskConfig.new(structuralStopMinPercent = 0.30, structuralStopMaxPercent = 0.40),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+// ── EURUSD ──
+buildConfigEURUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()                                   // Asia
+    array.push(killzoneHours, continuationHour(1))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    AssetConfig.new("EURUSD", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         RiskConfig.new(structuralStopMinPercent = 0.03, structuralStopMaxPercent = 0.06),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+// ── GBPJPY ──
+buildConfigGBPJPY() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, continuationHour(1))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    array.push(killzoneHours, continuationHour(6)) 
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    AssetConfig.new("GBPJPY", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         RiskConfig.new(structuralStopMinPercent = 0.05, structuralStopMaxPercent = 0.10),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+
+// ── GBPUSD ──
+buildConfigGBPUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, continuationHour(1))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    AssetConfig.new("GBPUSD", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         RiskConfig.new(structuralStopMinPercent = 0.06, structuralStopMaxPercent = 0.10),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+// ── XAUUSD ──
+buildConfigXAUUSD() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    array.push(killzoneHours, continuationHour(1))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    AssetConfig.new("XAUUSD", true,
+         SharedConfig.new(volumeGateEnabled = false, volumeThreshold = 1.5, biasConfirmCount = 1),
+         RiskConfig.new(structuralStopMinPercent = 0.20, structuralStopMaxPercent = 0.30),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 2.0))
+
+
+// ── USDCHF ──
+buildConfigUSDCHF() =>
+    array<ammo.KillzoneHour> killzoneHours = array.new<ammo.KillzoneHour>()                                   // Asia
+    array.push(killzoneHours, continuationHour(11))
+    array.push(killzoneHours, continuationHour(12))
+    array.push(killzoneHours, continuationHour(13))
+    array.push(killzoneHours, continuationHour(14))
+    array.push(killzoneHours, continuationHour(16))
+    array.push(killzoneHours, continuationHour(17))
+    array.push(killzoneHours, continuationHour(18))
+    array.push(killzoneHours, continuationHour(21))
+    array.push(killzoneHours, continuationHour(22))
+    array.push(killzoneHours, continuationHour(23))
+    array.push(killzoneHours, continuationHour(1))
+    array.push(killzoneHours, continuationHour(2))
+    array.push(killzoneHours, continuationHour(3))
+    array.push(killzoneHours, continuationHour(4))
+    array.push(killzoneHours, continuationHour(5))
+    AssetConfig.new("USDCHF", true,
+         SharedConfig.new(volumeGateEnabled = true, volumeThreshold = 1.5, biasConfirmCount = 2),
+         RiskConfig.new(structuralStopMinPercent = 0.07, structuralStopMaxPercent = 0.10),
+         KillzoneConfig.new(restrictEnabled = true, activeHours = killzoneHours),
+         DexConfig.new(enabled = true, emaTrendEnabled = false, biasFilterEnabled = false, stopSource = "OB Zone Edge", riskRewardRatio = 3.0))
+
+
+// ── asset router — ticker → its config block ──
+detectAsset() =>
+    string upperTicker = str.upper(syminfo.ticker)
+    AssetConfig assetConfig = na
+    if str.contains(upperTicker, "BTCUSD") or str.contains(upperTicker, "BTCUSD")
+        assetConfig := buildConfigBTCUSD("BTCUSD", true)
+    else if str.contains(upperTicker, "AUDJPY") or str.contains(upperTicker, "AUD/JPY")
+        assetConfig := buildConfigAUDJPY()
+    else if str.contains(upperTicker, "AUDUSD") or str.contains(upperTicker, "AUD/USD")
+        assetConfig := buildConfigAUDUSD()  
+    else if str.contains(upperTicker, "EURUSD") or str.contains(upperTicker, "EUR/USD")
+        assetConfig := buildConfigEURUSD()
+    else if str.contains(upperTicker, "GBPJPY") or str.contains(upperTicker, "GBP/JPY")
+        assetConfig := buildConfigGBPJPY()  
+    else if str.contains(upperTicker, "GBPUSD") or str.contains(upperTicker, "GBP/USD")
+        assetConfig := buildConfigGBPUSD()    
+    else if str.contains(upperTicker, "XAUUSD") or str.contains(upperTicker, "XAU/USD")
+        assetConfig := buildConfigXAUUSD() 
+    else if str.contains(upperTicker, "USDCHF") or str.contains(upperTicker, "USD/CHF")
+        assetConfig := buildConfigUSDCHF()  
+    else
+        assetConfig := buildConfigBTCUSD("UNK", false)
+    assetConfig
+
+var AssetConfig assetConfig = detectAsset()
+
+var table unknownAssetWarning = table.new(position.top_left, 1, 1)
+if barstate.islast and not assetConfig.isKnownAsset
+    table.cell(unknownAssetWarning, 0, 0, "⚠ " + syminfo.ticker + " not in config — using XAU defaults", text_color = color.white, bgcolor = color.new(color.red, 0), text_size = size.small)
+
+// ═══ CURRENT TIME ════════════════════════════════════════════════════════════
+hourLocal   = hour  (time, anchorTimezone)
+minuteLocal = minute(time, anchorTimezone)
+phaseLetter(int quarterIndex) => quarterIndex == 1 ? "A" : quarterIndex == 2 ? "M" : quarterIndex == 3 ? "D" : "C"
+phaseColor(int quarterIndex)  => quarterIndex == 1 ? accumulationColor : quarterIndex == 2 ? manipulationColor : quarterIndex == 3 ? distributionColor : continuationColor
+string timestampLocal = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssXXX", anchorTimezone)
+string timestampUtc   = str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+
+// ═══ TIME MATH — resolve via library ═════════════════════════════════════════
+[containerIndex, quarterIndex] = ammo.resolveContainerQuarter(time, anchorTimezone, sessionAnchorStartHour)
+string killzoneWindowName      = ammo.sessionName(hourLocal)
+dexBlackout() => ammo.isWeekendBlackout(time, anchorTimezone, sessionAnchorStartHour)
+
+// ═══ QUARTERLY ENGINE — VISUAL OUTPUT ════════════════════════════════════════
+type ContainerVisual
+    int   containerKey  = na
+    box   containerBox  = na
+    float runningHigh   = na
+    float runningLow    = na
+
+type QuarterVisual
+    int   quarterKey   = na
+    box   quarterBox   = na
+    label quarterLabel = na
+
+var ContainerVisual currentContainerVisual = ContainerVisual.new()
+var QuarterVisual   currentQuarterVisual   = QuarterVisual.new()
+var array<box>           containerBoxHistory  = array.new<box>()
+var array<QuarterVisual> quarterVisualHistory = array.new<QuarterVisual>()
+
+int containerBoxCap = math.min(historyLookbackDays * 24, 80)
+int quarterBoxCap   = math.min(historyLookbackDays * 96, 300)
+
+capContainerBoxHistory(array<box> boxHistory, box newBox, int cap) =>
+    array.push(boxHistory, newBox)
+    while array.size(boxHistory) > cap
+        box oldestBox = array.shift(boxHistory)
+        if not na(oldestBox)
+            box.delete(oldestBox)
+
+capQuarterVisualHistory(array<QuarterVisual> visualHistory, QuarterVisual newVisual, int cap) =>
+    array.push(visualHistory, newVisual)
+    while array.size(visualHistory) > cap
+        QuarterVisual oldestVisual = array.shift(visualHistory)
+        if not na(oldestVisual)
+            if not na(oldestVisual.quarterBox)
+                box.delete(oldestVisual.quarterBox)
+            if not na(oldestVisual.quarterLabel)
+                label.delete(oldestVisual.quarterLabel)
+
+updateContainerVisual() =>
+    bool isNewContainer = na(currentContainerVisual.containerKey) or currentContainerVisual.containerKey != containerIndex
+    if isNewContainer
+        if not na(currentContainerVisual.containerBox)
+            box.set_right(currentContainerVisual.containerBox, time)
+        currentContainerVisual.runningHigh  := high
+        currentContainerVisual.runningLow   := low
+        currentContainerVisual.containerKey := containerIndex
+        if showHourContainerBox
+            box newContainerBox = box.new(time, high, time, low, xloc = xloc.bar_time,
+                 border_color = color.new(color.orange, 40), border_style = line.style_dashed, bgcolor = color.new(color.gray, 100))
+            capContainerBoxHistory(containerBoxHistory, newContainerBox, containerBoxCap)
+            currentContainerVisual.containerBox := newContainerBox
+    else
+        currentContainerVisual.runningHigh := math.max(currentContainerVisual.runningHigh, high)
+        currentContainerVisual.runningLow  := math.min(currentContainerVisual.runningLow,  low)
+        if showHourContainerBox and not na(currentContainerVisual.containerBox)
+            box.set_top   (currentContainerVisual.containerBox, currentContainerVisual.runningHigh)
+            box.set_bottom(currentContainerVisual.containerBox, currentContainerVisual.runningLow)
+            box.set_right (currentContainerVisual.containerBox, time)
+    int(na)
+
+updateQuarterVisual() =>
+    int quarterKey = containerIndex * 10 + quarterIndex
+    color quarterColor = phaseColor(quarterIndex)
+    bool isNewQuarter = na(currentQuarterVisual.quarterKey) or currentQuarterVisual.quarterKey != quarterKey
+    if isNewQuarter
+        box newQuarterBox = box.new(time, high, time_close, low, xloc = xloc.bar_time,
+             border_color = color.new(quarterColor, 30), border_style = line.style_dotted, bgcolor = quarterColor)
+        label newQuarterLabel = na
+        if showQuarterLabels
+            newQuarterLabel := label.new(time + 450000, (high + low) / 2, phaseLetter(quarterIndex),
+                 xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, textcolor = color.white, size = size.normal)
+        QuarterVisual newQuarterVisual = QuarterVisual.new(quarterKey, newQuarterBox, newQuarterLabel)
+        capQuarterVisualHistory(quarterVisualHistory, newQuarterVisual, quarterBoxCap)
+        currentQuarterVisual.quarterKey   := newQuarterVisual.quarterKey
+        currentQuarterVisual.quarterBox   := newQuarterVisual.quarterBox
+        currentQuarterVisual.quarterLabel := newQuarterVisual.quarterLabel
+    if not isNewQuarter and not na(currentQuarterVisual.quarterBox)
+        box.set_right (currentQuarterVisual.quarterBox, time_close)
+        box.set_top   (currentQuarterVisual.quarterBox, math.max(box.get_top   (currentQuarterVisual.quarterBox), high))
+        box.set_bottom(currentQuarterVisual.quarterBox, math.min(box.get_bottom(currentQuarterVisual.quarterBox), low))
+        if showQuarterLabels and not na(currentQuarterVisual.quarterLabel)
+            label.set_y(currentQuarterVisual.quarterLabel, (box.get_top(currentQuarterVisual.quarterBox) + box.get_bottom(currentQuarterVisual.quarterBox)) / 2)
+    int(na)
+
+if not dexBlackout()
+    updateContainerVisual()
+    if showQuarterBoxes
+        updateQuarterVisual()
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCAL ENGINE CONFIGS
+// ═══════════════════════════════════════════════════════════════════════════
+biasConfirmCount    = assetConfig.shared.biasConfirmCount
+volumeFilterEnabled = assetConfig.shared.volumeGateEnabled
+volumeMultiplier    = assetConfig.shared.volumeThreshold
+volumeAverageLength = 20
+
+structuralStopMinDistance = ammo.percentToDistance(close, assetConfig.risk.structuralStopMinPercent)
+structuralStopMaxDistance = ammo.percentToDistance(close, assetConfig.risk.structuralStopMaxPercent)
+
+// DEX
+dexEnabled           = assetConfig.dex.enabled
+dexEmaTrendEnabled   = assetConfig.dex.emaTrendEnabled
+dexBiasFilterEnabled = assetConfig.dex.biasFilterEnabled
+dexStopSource        = assetConfig.dex.stopSource
+dexRiskRewardRatio   = assetConfig.dex.riskRewardRatio
+
+// killzone (shared)
+killzoneConfig = assetConfig.killzone
+
+// ═══ STRUCTURE ENGINE — library SMC ══════════════════════════════════════════
+var ammo.smcState structureState = ammo.newState()
+ammo.smcResult structureResult = ammo.run(internalLen = internalPivotLength, swingLen = swingPivotLength,
+     confluence = structureConfluence, present = structurePresentMode,
+     showMSB = showStructureBreaks, bullCol = bullishStructureColor, bearCol = bearishStructureColor,
+     showOB = showOrderBlocks, maxOB = maxOrderBlocksKept, obFilter = orderBlockFilter, obMitigation = orderBlockMitigation, obBullCol = demandOrderBlockColor, obBearCol = supplyOrderBlockColor,
+     showFVG = false, st = structureState)
+bool bullishStructureBreak = structureResult.bosBull
+bool bearishStructureBreak = structureResult.bosBear
+float lastPivotHigh = structureResult.lastPivotHigh
+float lastPivotLow  = structureResult.lastPivotLow
+
+// ═══ VOLUME ENGINE ═══════════════════════════════════════════════════════════
+float volumeAverage   = ta.sma(volume, volumeAverageLength)
+bool  volumeConfirmed = not na(volume) and not na(volumeAverage) and volumeAverage > 0 and volume > volumeAverage * volumeMultiplier
+
+// ═══ BIAS ENGINE — 1m → 15m quarter accumulation ═════════════════════════════
+type BiasVerdict
+    int   ratifiedBiasId  = 0
+    int   marketStateId   = 0
+    int   closeTime       = na
+    int   spotBiasId      = 0
+    int   bullishStreak   = 0
+    int   bearishStreak   = 0
+
+var ammo.PeriodOHLC    biasQuarter = ammo.PeriodOHLC.new()
+var BiasVerdict        biasVerdict = BiasVerdict.new()
+
+if not dexBlackout()
+    ammo.advancePeriod(biasQuarter, containerIndex * 10 + quarterIndex, bar_index, open, high, low, close)
+    if biasQuarter.justClosed and not na(biasQuarter.previousClosedHigh)
+        [spotBias, marketState] = ammo.evaluateBias(biasQuarter.closedHigh, biasQuarter.closedLow, biasQuarter.previousClosedHigh, biasQuarter.previousClosedLow)
+        if spotBias == ammo.BIAS_BULLISH
+            biasVerdict.bullishStreak := biasVerdict.bullishStreak + 1
+            biasVerdict.bearishStreak := 0
+        if spotBias == ammo.BIAS_BEARISH
+            biasVerdict.bearishStreak := biasVerdict.bearishStreak + 1
+            biasVerdict.bullishStreak := 0
+        if spotBias == ammo.BIAS_RANGING
+            biasVerdict.bullishStreak := 0
+            biasVerdict.bearishStreak := 0
+        int ratifiedBias = ammo.BIAS_RANGING
+        if biasVerdict.bullishStreak >= biasConfirmCount
+            ratifiedBias := ammo.BIAS_BULLISH
+        if biasVerdict.bearishStreak >= biasConfirmCount
+            ratifiedBias := ammo.BIAS_BEARISH
+        biasVerdict.spotBiasId     := spotBias
+        biasVerdict.ratifiedBiasId := ratifiedBias
+        biasVerdict.marketStateId  := marketState
+        biasVerdict.closeTime      := time
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRADE TRACKER ENGINE — one open position (DEX); future-proofed for more
+// ───────────────────────────────────────────────────────────────────────────
+// pending + arm* fields carry an armed setup from the arm bar (N) to the fill
+// bar (N+1): the arm captures direction and OB-zone edges, the fill consumes them.
+// Breakeven (tracker only — never on the alert path):
+//   Once price moves 50% of the ORIGINAL stop distance (0.5R) in favour, the
+//   tracked stop moves to entry ONCE and the trade runs to the original target.
+//   Exit at entry after the move records 0R (breakeven), not a loss.
+//   R multiples are always measured against initialRisk (the original stop),
+//   never the moved stop.
+// ═══════════════════════════════════════════════════════════════════════════
+type StrategyTrade
+    int   direction     = 0
+    float entryPrice    = na
+    float stopPrice     = na
+    float targetPrice   = na
+    float initialRisk   = na
+    bool  beArmed       = false
+    bool  open          = false
+    bool  pending       = false
+    int   openBar       = na
+    box   stopBox       = na
+    box   targetBox     = na
+    int   armDirection  = 0
+    float armZoneTop    = na
+    float armZoneBottom = na
+
+resolveStrategyTrade(StrategyTrade strategyTrade) =>
+    bool  stillOpen         = strategyTrade.open
+    float realisedRMultiple = na
+    if strategyTrade.open and not na(strategyTrade.stopPrice) and not na(strategyTrade.targetPrice)
+        float riskDistance = na(strategyTrade.initialRisk) ? math.abs(strategyTrade.entryPrice - strategyTrade.stopPrice) : strategyTrade.initialRisk
+        // ── breakeven arm — 0.5R in favour → stop walks to entry (once) ──
+        if moveStopToBreakeven and not strategyTrade.beArmed and riskDistance > 0
+            float beTrigger = strategyTrade.direction == DIRECTION_LONG ?
+                 strategyTrade.entryPrice + 0.5 * riskDistance :
+                 strategyTrade.entryPrice - 0.5 * riskDistance
+            if (strategyTrade.direction == DIRECTION_LONG and high >= beTrigger) or (strategyTrade.direction == DIRECTION_SHORT and low <= beTrigger)
+                strategyTrade.stopPrice := strategyTrade.entryPrice
+                strategyTrade.beArmed   := true
+                if not na(strategyTrade.stopBox)
+                    box.set_top   (strategyTrade.stopBox, strategyTrade.entryPrice)
+                    box.set_bottom(strategyTrade.stopBox, strategyTrade.entryPrice)
+        // ── exits — BE-armed stop-outs record 0R; losses only from the original stop ──
+        if strategyTrade.direction == DIRECTION_LONG
+            if low <= strategyTrade.stopPrice
+                stillOpen         := false
+                realisedRMultiple := strategyTrade.beArmed ? 0.0 : -1.0
+            else if high >= strategyTrade.targetPrice
+                stillOpen         := false
+                realisedRMultiple := riskDistance > 0 ? (strategyTrade.targetPrice - strategyTrade.entryPrice) / riskDistance : 0.0
+        else
+            if high >= strategyTrade.stopPrice
+                stillOpen         := false
+                realisedRMultiple := strategyTrade.beArmed ? 0.0 : -1.0
+            else if low <= strategyTrade.targetPrice
+                stillOpen         := false
+                realisedRMultiple := riskDistance > 0 ? (strategyTrade.entryPrice - strategyTrade.targetPrice) / riskDistance : 0.0
+    [stillOpen, realisedRMultiple]
+
+// clamp a structural stop level into the [min, max] distance band, then the trade
+// STILL FIRES: too-tight → widen to min ; too-wide → tighten to max. A na level
+// passes through so resolveEntry still rejects it; its geometry guard remains.
+clampStopToBand(int direction, float entryPrice, float structuralStopLevel, float minDistance, float maxDistance) =>
+    float clampedLevel = structuralStopLevel
+    if not na(structuralStopLevel)
+        float distance = math.abs(entryPrice - structuralStopLevel)
+        if distance < minDistance
+            clampedLevel := direction == DIRECTION_LONG ? entryPrice - minDistance : entryPrice + minDistance
+        else if maxDistance > 0 and distance > maxDistance
+            clampedLevel := direction == DIRECTION_LONG ? entryPrice - maxDistance : entryPrice + maxDistance
+    clampedLevel
+
+zoneBox(float topPrice, float bottomPrice, color zoneColor) =>
+    box.new(time, topPrice, time, bottomPrice, bgcolor = color.new(zoneColor, 80), border_color = color.new(zoneColor, 60), xloc = xloc.bar_time)
+
+var StrategyTrade dexTrade = StrategyTrade.new()
+
+anyTradeOpen() => dexTrade.open
+tradeEntryAllowed() => not blockNewEntriesWhileTradeOpen or not anyTradeOpen()
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FA_1: DEX (Doyle Exchange Model) — structured signal pipeline
+// ───────────────────────────────────────────────────────────────────────────
+//   Stages, in order:  FILTERS → SETUP → VALIDATION → RE-ENTRY GUARD →
+//                      ENTRY TRIGGER → STOP/TARGET
+//
+//   A continuation model: a candle wicks into a drawn order block and CLOSES back
+//   out of it (rejection), then the trade enters on the CLOSE of the next bar.
+//
+//   QUARTER GATING (one quarter concept, A/M/D/C = quarterIndex 1/2/3/4):
+//     ARM   in M or D (Q2/Q3) — the rejection bar that sets dexTrade.pending
+//     FILL  the next bar       — lands in D or C
+//   The killzone (checked ONCE, at the arm) opens M/D/C so both the arm quarters
+//   (M/D) and the fill (D/C) sit inside it.
+//
+//   FILTERS (both optional, per-asset):
+//     ema trend  — 200-EMA agreement (dexEmaTrendEnabled)
+//     bias       — ratified HTF quarter bias (dexBiasFilterEnabled)
+//   RE-ENTRY GUARD — a fired zone is retired; one fill per quarter; bar cooldown.
+//   STOP (per-asset, dexStopSource): "Swing" (last SMC swing) or "OB Zone Edge"
+//   (armed OB edge). The library band-gates the stop and resolves the target.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══ FILTERS ═════════════════════════════════════════════════════════════════
+// Bar-level permissions, checked before any setup is considered.
+//   killzone : must sit inside an active killzone hour+quarter (per-asset), not blackout
+//   bias     : OPTIONAL HTF directional filter (off → pass-through both sides)
+
+// ── killzone ── (consumes host hourLocal + quarterIndex; no separate time math)
+bool filterKillzoneOpen = not dexBlackout() and (not killzoneConfig.restrictEnabled or ammo.isKillzoneOpen(killzoneConfig.activeHours, hourLocal, quarterIndex))
+
+// ── bias (optional, HTF) ──
+bool filterBiasAllowsLong  = not dexBiasFilterEnabled or biasVerdict.ratifiedBiasId == ammo.BIAS_BULLISH
+bool filterBiasAllowsShort = not dexBiasFilterEnabled or biasVerdict.ratifiedBiasId == ammo.BIAS_BEARISH
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPEN-TRADE MANAGEMENT — runs every bar (independent of the setup sequence)
+// ═══════════════════════════════════════════════════════════════════════════
+// Resolves the live DEX trade (stop-first) and tallies wins / losses / BEs / net R.
+// Runs BEFORE ENTRY TRIGGER so dexTrade.open is freshly resolved when the arm
+// guard (tradeIsFlat) is evaluated.
+var int   dexWinCount       = 0
+var int   dexLossCount      = 0
+var int   dexBreakevenCount = 0
+var float dexNetRMultiple   = 0.0
+[dexStillOpen, dexRealisedR] = resolveStrategyTrade(dexTrade)
+dexTrade.open := dexStillOpen
+if not na(dexRealisedR)
+    dexWinCount       += dexRealisedR > 0 ? 1 : 0
+    dexLossCount      += dexRealisedR < 0 ? 1 : 0
+    dexBreakevenCount += dexRealisedR == 0 ? 1 : 0
+    dexNetRMultiple   += dexRealisedR
+if dexTrade.open and not na(dexTrade.stopBox)
+    box.set_right(dexTrade.stopBox, time)
+    box.set_right(dexTrade.targetBox, time)
+
+// ═══ SETUP ═══════════════════════════════════════════════════════════════════
+// Gate: a DRAWN order block exists and price WICKED into it this bar.
+//   Scans only the drawn OBs; captures the first qualifying zone per side.
+//   "wick into the zone" = the bar's extreme entered the OB range.
+bool  setupDemandWicked   = false   // price wicked into a demand (long) OB
+bool  setupSupplyWicked   = false   // price wicked into a supply (short) OB
+float setupZoneTop        = na      // captured zone edges (for the rejection test)
+float setupZoneBottom     = na
+
+int dexVisibleOrderBlockCount = math.min(maxOrderBlocksKept, structureState.internalOrderBlocks.size())
+if dexVisibleOrderBlockCount > 0
+    for orderBlockIndex = 0 to dexVisibleOrderBlockCount - 1
+        ammo.orderBlock currentOrderBlock = structureState.internalOrderBlocks.get(orderBlockIndex)
+        float currentZoneTop    = currentOrderBlock.barHigh
+        float currentZoneBottom = currentOrderBlock.barLow
+        if not na(currentZoneTop) and not na(currentZoneBottom)
+            // demand OB — long side: the LOW wicked into the zone
+            if currentOrderBlock.bias == DIRECTION_LONG and low <= currentZoneTop and low >= currentZoneBottom and not setupDemandWicked
+                setupDemandWicked := true
+                setupZoneTop      := currentZoneTop
+                setupZoneBottom   := currentZoneBottom
+            // supply OB — short side: the HIGH wicked into the zone
+            if currentOrderBlock.bias == DIRECTION_SHORT and high >= currentZoneBottom and high <= currentZoneTop and not setupSupplyWicked
+                setupSupplyWicked := true
+                setupZoneTop      := currentZoneTop
+                setupZoneBottom   := currentZoneBottom
+
+// ═══ VALIDATION ══════════════════════════════════════════════════════════════
+// Confirmation that the wicked setup is a genuine rejection, with optional trend.
+//   rejection : the candle CLOSED back out of the zone (always required)
+//                 long  → close above the zone top
+//                 short → close below the zone bottom
+//   ema trend : OPTIONAL 200-EMA agreement (off → pass-through)
+//                 long  → close above EMA (bullish)
+//                 short → close below EMA (bearish)
+
+// ── rejection (always) ──
+bool validationRejectionLong  = setupDemandWicked and close > setupZoneTop
+bool validationRejectionShort = setupSupplyWicked and close < setupZoneBottom
+
+// ── ema trend (optional) ──
+float emaTrendValue = ta.ema(close, 200)
+bool validationEmaTrendLong  = not dexEmaTrendEnabled or close > emaTrendValue
+bool validationEmaTrendShort = not dexEmaTrendEnabled or close < emaTrendValue
+
+// ── combined validation (rejection + optional ema + optional bias) ──
+bool validatedLong  = validationRejectionLong  and validationEmaTrendLong  and filterBiasAllowsLong
+bool validatedShort = validationRejectionShort and validationEmaTrendShort and filterBiasAllowsShort
+
+// ═══ RE-ENTRY GUARD ══════════════════════════════════════════════════════════
+// WHY: DEX arms whenever the book is FLAT. A stop-out returns it to flat while
+// the SAME order block is still drawn — so the very next bar re-arms on the setup
+// that just failed. Three independent brakes, all evaluated at the arm:
+//   zone     : the zone that produced the last signal is RETIRED — it can never
+//              fire again, however many times price returns to it. (root fix)
+//   quarter  : at most one fill per 15m quarter, whichever zone it came from
+//   cooldown : N 1m bars must pass since the last fill (0 = off)
+var int   dexLastSignalQuarterKey = na
+var int   dexLastSignalBar        = na
+var float dexRetiredZoneTop       = na
+var float dexRetiredZoneBottom    = na
+
+int  dexQuarterKey     = containerIndex * 10 + quarterIndex
+bool guardZoneOk       = not dexBlockRetradedZone or na(dexRetiredZoneTop) or setupZoneTop != dexRetiredZoneTop or setupZoneBottom != dexRetiredZoneBottom
+bool guardQuarterOk    = not dexOneSignalPerQuarter or na(dexLastSignalQuarterKey) or dexLastSignalQuarterKey != dexQuarterKey
+bool guardCooldownOk   = dexCooldownBars == 0 or na(dexLastSignalBar) or bar_index - dexLastSignalBar >= dexCooldownBars
+bool dexReentryAllowed = guardZoneOk and guardQuarterOk and guardCooldownOk
+
+// ═══ ENTRY TRIGGER ═══════════════════════════════════════════════════════════
+// Signal: ONE direction per bar. If both sides validate → conflicted → take
+//   neither. Arm only when FLAT (single position), the killzone is open, the bar
+//   is in M or D (quarterIndex 2 or 3), and the RE-ENTRY GUARD allows it. Arming
+//   on Bar N (M/D); the entry fills on Bar N+1's close (lands D/C) below.
+bool dexLong  = false   // arm flag (this bar validated long → arms pending)
+bool dexShort = false   // arm flag (this bar validated short → arms pending)
+
+bool tradeIsFlat  = not dexTrade.open and not dexTrade.pending
+bool armQuarterOk = quarterIndex == 2 or quarterIndex == 3
+int  armDirection = validatedLong and validatedShort ? 0 : validatedLong ? DIRECTION_LONG : validatedShort ? DIRECTION_SHORT : 0
+
+if armDirection != 0 and filterKillzoneOpen and armQuarterOk and tradeIsFlat and dexReentryAllowed
+    dexLong                := armDirection == DIRECTION_LONG
+    dexShort               := armDirection == DIRECTION_SHORT
+    dexTrade.pending       := true
+    dexTrade.armDirection  := armDirection
+    dexTrade.armZoneTop    := setupZoneTop
+    dexTrade.armZoneBottom := setupZoneBottom
+
+// ═══ ENTRY / STOP / TARGET ═══════════════════════════════════════════════════
+// Fires on the CLOSE of the bar after the arm (Bar N+1). Entry = that close.
+//   Stop source (per asset, dexStopSource):
+//     "Swing"        → last SMC swing  (long → swingLow, short → swingHigh)
+//     "OB Zone Edge" → armed OB edge   (long → armZoneBottom, short → armZoneTop)
+//   The library resolves stop + target + structural band in one call.
+bool dexFillLong  = false
+bool dexFillShort = false
+
+if dexEnabled and barstate.isconfirmed and dexTrade.pending and not dexTrade.open
+    bool  directionIsLong = dexTrade.armDirection == DIRECTION_LONG
+    float entryPrice      = close   // entry: close of the bar AFTER the wick-rejection
+
+    float swingStopLevel    = directionIsLong ? structureState.swingLow.currentLevel : structureState.swingHigh.currentLevel
+    float zoneEdgeStopLevel = directionIsLong ? dexTrade.armZoneBottom : dexTrade.armZoneTop
+    float stopLevel         = clampStopToBand(dexTrade.armDirection, entryPrice, dexStopSource == "OB Zone Edge" ? zoneEdgeStopLevel : swingStopLevel, structuralStopMinDistance, structuralStopMaxDistance)
+
+    [stopPrice, targetPrice, entryValid] = ammo.resolveEntry(dexTrade.armDirection, entryPrice, stopLevel, structuralStopMinDistance, structuralStopMaxDistance, dexRiskRewardRatio)
+    if entryValid
+        dexFillLong          := directionIsLong
+        dexFillShort         := not directionIsLong
+        dexTrade.direction   := dexTrade.armDirection
+        dexTrade.entryPrice  := entryPrice
+        dexTrade.stopPrice   := stopPrice
+        dexTrade.targetPrice := targetPrice
+        dexTrade.initialRisk := math.abs(entryPrice - stopPrice)
+        dexTrade.beArmed     := false
+        dexTrade.open        := true
+        dexTrade.openBar     := bar_index
+        // ── RE-ENTRY GUARD bookkeeping — retire this zone, stamp the quarter + bar ──
+        dexRetiredZoneTop       := dexTrade.armZoneTop
+        dexRetiredZoneBottom    := dexTrade.armZoneBottom
+        dexLastSignalQuarterKey := dexQuarterKey
+        dexLastSignalBar        := bar_index
+        if showTradeZoneBoxes
+            dexTrade.stopBox   := directionIsLong ? zoneBox(entryPrice, stopPrice, color.red) : zoneBox(stopPrice, entryPrice, color.red)
+            dexTrade.targetBox := directionIsLong ? zoneBox(targetPrice, entryPrice, color.green) : zoneBox(entryPrice, targetPrice, color.green)
+    dexTrade.pending := false   // armed setup consumed (filled, or band/geometry-rejected)
+
+// ═══ SIGNAL MARKERS ══════════════════════════════════════════════════════════
+plotshape(dexFillLong,  "DEX Long",  style = shape.triangleup,   location = location.belowbar, color = dexLongColor,  size = size.small, text = "L (DEX)", textcolor = color.white)
+plotshape(dexFillShort, "DEX Short", style = shape.triangledown, location = location.abovebar, color = dexShortColor, size = size.small, text = "S (DEX)", textcolor = color.white)
+
+// ═══ LAST-SIGNAL TRACKING ════════════════════════════════════════════════════
+var int   dexLastDirection = 0
+var float dexLastPrice     = na
+var int   dexLastTime      = na
+if dexFillLong or dexFillShort
+    dexLastDirection := dexFillLong ? DIRECTION_LONG : DIRECTION_SHORT
+    dexLastPrice     := dexTrade.entryPrice
+    dexLastTime      := time
+
+formatLastSignal(int signalDirection, float signalPrice, int signalTime) =>
+    signalDirection == 0 or na(signalTime) ? "—" : (signalDirection == DIRECTION_LONG ? "LONG " : "SHORT ") + str.tostring(signalPrice, format.mintick) + " @ " + str.format_time(signalTime, "MMM-dd HH:mm", anchorTimezone)
+
+// ═══ STATS TABLE ═════════════════════════════════════════════════════════════
+var table statsTable = table.new(position.bottom_right, 2, 10, border_width = 1)
+statsRow(int rowIndex, string label, string value, color valueColor) =>
+    table.cell(statsTable, 0, rowIndex, label, text_color = color.white, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_left)
+    table.cell(statsTable, 1, rowIndex, value, text_color = valueColor, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_right)
+if showStatsTable and barstate.islast
+    color headerBackground = color.new(#1a237e, 20)
+    color profitColor      = color.new(#00e676, 0)
+    color highlightColor   = color.new(#ffeb3b, 0)
+    int   dexTradeCount  = dexWinCount + dexLossCount + dexBreakevenCount
+    int   decisiveTrades = dexWinCount + dexLossCount
+    float winRate        = decisiveTrades > 0 ? dexWinCount * 100.0 / decisiveTrades : 0.0
+    float profitDollars  = dexNetRMultiple * riskDollarsPerR
+    int rowIndex = 0
+    table.cell(statsTable, 0, rowIndex, "SNIPER_DELTA — Stats", text_color = color.white, bgcolor = headerBackground, text_halign = text.align_left)
+    table.cell(statsTable, 1, rowIndex, "", bgcolor = headerBackground)
+    rowIndex += 1
+    statsRow(rowIndex, "Total Trades", str.tostring(dexTradeCount), color.white)
+    rowIndex += 1
+    statsRow(rowIndex, "W / L / BE", str.tostring(dexWinCount) + " / " + str.tostring(dexLossCount) + " / " + str.tostring(dexBreakevenCount), color.white)
+    rowIndex += 1
+    statsRow(rowIndex, "Win Rate (ex-BE)", str.tostring(winRate, "#.##") + "%", highlightColor)
+    rowIndex += 1
+    statsRow(rowIndex, "Profit ($ / R)", "$" + str.tostring(profitDollars, "#.##") + "  (" + str.tostring(dexNetRMultiple, "#.#") + "R)", profitColor)
+    rowIndex += 1
+    statsRow(rowIndex, "Killzone", killzoneWindowName, color.white)
+    rowIndex += 1
+    statsRow(rowIndex, "Active OBs", str.tostring(structureState.internalOrderBlocks.size()), color.white)
+    rowIndex += 1
+    statsRow(rowIndex, "Trade Open", dexTrade.open ? "OPEN" : "FLAT", dexTrade.open ? color.new(#ff5252, 0) : color.new(#00e676, 0))
+    rowIndex += 1
+    statsRow(rowIndex, "BE @ 0.5R", moveStopToBreakeven ? "ON" : "OFF", moveStopToBreakeven ? color.new(#00e676, 0) : color.gray)
+
+// ═══ UNIFIED DASHBOARD ═══════════════════════════════════════════════════════
+var table dashboardTable = table.new(position.top_right, 2, 5,
+     bgcolor = color.new(#1e222d, 0), border_color = #373a46, border_width = 1, frame_color = #373a46, frame_width = 1)
+dashboardRow(int rowIndex, string label, string value, color valueColor) =>
+    table.cell(dashboardTable, 0, rowIndex, label, text_color = color.white, text_size = size.small, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_left)
+    table.cell(dashboardTable, 1, rowIndex, value, text_color = valueColor, text_size = size.small, bgcolor = color.new(#1c1c2e, 60), text_halign = text.align_right)
+if showUnifiedDashboard and barstate.islast
+    table.cell(dashboardTable, 0, 0, "SNIPER_DELTA — Panel", text_color = color.white, text_size = size.small, bgcolor = color.new(#1a237e, 20), text_halign = text.align_left)
+    table.cell(dashboardTable, 1, 0, "Active", text_color = color.white, text_size = size.small, bgcolor = color.new(#1a237e, 20), text_halign = text.align_right)
+    dashboardRow(1, "Killzone", killzoneWindowName, color.white)
+    dashboardRow(2, "Scalp Bias", ammo.biasText(biasVerdict.ratifiedBiasId), ammo.biasColor(biasVerdict.ratifiedBiasId))
+    dashboardRow(3, "Phase", phaseLetter(quarterIndex), color.white)
+    dashboardRow(4, "Last signal", formatLastSignal(dexLastDirection, dexLastPrice, dexLastTime), dexLastDirection == DIRECTION_LONG ? color.new(#00e676, 0) : dexLastDirection == DIRECTION_SHORT ? color.new(#f23645, 0) : color.gray)
+
+// ═══ ALERTS ══════════════════════════════════════════════════════════════════
+// NOTE: alert path is untouched by the breakeven tracker. Payloads fire once at
+// entry with the ORIGINAL entry/SL/TP; the EA manages stops with its own logic.
+string schemaVersion   = "2.0.0"
+string providerName    = "tradingview"
+string chartType       = "Candle"
+string dexStrategyId   = "SD-DEX-" + assetConfig.assetCode
+string dexStrategyName = "SNIPER_DELTA_DEX"
+string brokerSymbol    = str.length(brokerSymbolOverride) > 0 ? brokerSymbolOverride : syminfo.ticker
+
+if dexFillLong and not na(dexTrade.stopPrice) and not na(dexTrade.targetPrice)
+    string signalId = dexStrategyId + "-L-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, dexStrategyId, dexStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "LONG", dexTrade.entryPrice, dexTrade.stopPrice, dexTrade.targetPrice, dexStrategyName + "-ENTRY-L")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)
+
+if dexFillShort and not na(dexTrade.stopPrice) and not na(dexTrade.targetPrice)
+    string signalId = dexStrategyId + "-S-" + str.tostring(time)
+    string payload  = ammo.payload(executionTarget, schemaVersion, providerName, dexStrategyId, dexStrategyName, signalId, timestampLocal, timestampUtc, chartType, timeframe.period, killzoneWindowName, brokerSymbol, "SHORT", dexTrade.entryPrice, dexTrade.stopPrice, dexTrade.targetPrice, dexStrategyName + "-ENTRY-S")
+    alert(payload, alert.freq_once_per_bar_close)
+    log.info(payload)

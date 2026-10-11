@@ -1,0 +1,694 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo — SMC engine forked from "Smart Money Concepts [LuxAlgo]" (v6).
+// ═══════════════════════════════════════════════════════════════════════════
+// Sniper_Ammo — shared engine library for the ACES snipers (BRAVO / CHARLIE / DELTA)
+// ───────────────────────────────────────────────────────────────────────────
+// Consolidates every piece of pure, stateless or state-threaded logic the
+// snipers share, so each execution script holds only its own identity + config:
+//
+//   SMC ENGINE     MSB + BOS + Order Blocks + FVG  (absorbed from ACES_ALPHA, intact;
+//                  hosts that don't need OB/FVG simply call run() with them disabled)
+//   SWING ENGINE   confirmed pivot high/low tracker (LuxAlgo swing detector, standalone)
+//   TRADE KILLZONES  per-window / 15m-slot resolver (host filters per asset)
+//   TIME MATH      container / quarter / blackout resolvers (anchor passed in)
+//   RISK MATH      stop / target distance helpers (stateless number-in/number-out)
+//   BIAS SCORING   closed-quarter window scorer -> [spotBias, marketState]
+//   TEXT / FORMAT  id -> human-readable text / colour helpers
+//   PAYLOAD        webhook JSON builder (host fires the actual alert())
+//
+// Library rules honoured: no input.*, no plot*/plotshape/plotcandle/alertcondition/
+// bgcolor/barcolor/fill/hline. Drawing (box/line/label/table) and var state ARE
+// allowed and used. UDTs are defined ONCE here — hosts use ammo.<type>, never
+// re-declare them. All mutable SMC state lives in smcState (create once per host
+// with newState(), pass into run()).
+//
+// VERIFY BEFORE PUBLISH: payload() JSON keys must match the MT5 bridge contract.
+//   Route key is currently "executionTarget"; take-profit key is "target".
+//
+// HOST WIRING:
+//   import <user>/Sniper_Ammo/<v> as ammo
+//   var ammo.smcState structureState = ammo.newState()
+//   ammo.smcResult r = ammo.run(internalLen = structLen, st = structureState)
+//     r.bosBull / r.bosBear   continuation break (WITH internal trend)
+//     r.msbBull / r.msbBear   reversal break / CHoCH (AGAINST internal trend)
+// ═══════════════════════════════════════════════════════════════════════════
+//@version=6
+library("Sniper_Ammo", overlay = true)
+
+// ═══ CONSTANTS ═══════════════════════════════════════════════════════════════
+
+// ── SMC engine (internal — used by the structure/OB/FVG detection) ──
+BULLISH     =  1
+BEARISH     = -1
+BULLISH_LEG =  1
+BEARISH_LEG =  0
+
+// ── Bias scoring (exported — hosts read ammo.BIAS_* / ammo.STATE_*) ──
+export const int BIAS_RANGING      = 0
+export const int BIAS_BULLISH      = 1
+export const int BIAS_BEARISH      = -1
+export const int STATE_NEUTRAL     = 0
+export const int STATE_EXPANSION   = 1
+export const int STATE_CONTRACTION = -1
+
+// ═══ SHARED UDTS (defined ONCE — hosts use ammo.<type>, never re-declare) ════
+
+// ── SMC engine types (from ALPHA, intact) ──
+
+export type pivot
+    float currentLevel = na
+    float lastLevel    = na
+    bool  crossed      = false
+    int   barTime      = na
+    int   barIndex     = na
+
+export type trend
+    int bias = 0
+
+// @field bias  BULLISH (demand/long OB) or BEARISH (supply/short OB)
+export type orderBlock
+    float barHigh = na
+    float barLow  = na
+    int   barTime = na
+    int   bias    = na
+
+export type fairValueGap
+    float top       = na
+    float bottom    = na
+    int   bias      = na
+    box   topBox    = na
+    box   bottomBox = na
+
+// @type all mutable engine state — create once per host with newState().
+//       Host may read internalOrderBlocks / fairValueGaps directly.
+export type smcState
+    pivot               swingHigh
+    pivot               swingLow
+    pivot               internalHigh
+    pivot               internalLow
+    trend               internalTrend
+    array<float>        parsedHighs
+    array<float>        parsedLows
+    array<int>          times
+    array<orderBlock>   internalOrderBlocks
+    array<box>          internalOrderBlocksBoxes
+    array<fairValueGap> fairValueGaps
+
+// @type per-bar result the host engines read
+export type smcResult
+    bool  bosBull       = false
+    bool  bosBear       = false
+    bool  msbBull       = false
+    bool  msbBear       = false
+    float lastPivotHigh = na
+    float lastPivotLow  = na
+    int   trendBias     = 0
+
+// ── Killzone / bias kit types ──
+
+// @type one closed 15m quarter — the unit the bias scorer consumes.
+export type ClosedQuarter
+    int   quarterKey  = na    // packed container*10 + quarter id
+    float topPrice    = na    // quarter high
+    float bottomPrice = na    // quarter low
+    float priceRange  = na    // top - bottom
+    float closePrice  = na    // quarter close (sweep / failed-2 tests)
+
+// ═══ PERIOD OHLC — rolling accumulator for a keyed period (container OR quarter) ═══
+// A period is a time bucket whose own high/low already wrap the wicks of every bar
+// inside it (a closed 15m quarter or 1h container is a single OHLC unit). This
+// accumulator builds the current period and retains the last TWO closed periods,
+// so any consumer can read the most-recent closed period and the one before it
+// (e.g. sweep / failed-2 comparisons, overextension, bias scoring).
+export type PeriodOHLC
+    int   periodKey            = na    // caller's key: container → containerIndex ; quarter → containerIndex*10+quarterIndex
+    int   startBar             = na    // bar_index where the current period began
+    float openPrice            = na    // current (forming) period
+    float highPrice            = na
+    float lowPrice             = na
+    float closePrice           = na
+    float closedOpen           = na    // most recently CLOSED period
+    float closedHigh           = na
+    float closedLow            = na
+    float closedClose          = na
+    float previousClosedOpen   = na    // the closed period BEFORE that
+    float previousClosedHigh   = na
+    float previousClosedLow    = na
+    float previousClosedClose  = na
+    bool  justClosed           = false // true on the bar a new period began (a period just closed)
+
+// @function Advance the accumulator with the current bar against a period key.
+//           On a new period: the forming period becomes the most-recent closed,
+//           the old closed shifts to previousClosed, and a fresh period starts.
+// @returns  the same state (mutated)
+export advancePeriod(PeriodOHLC state, int periodKey, int barIndex, float barOpen, float barHigh, float barLow, float barClose) =>
+    state.justClosed := false
+    if na(state.periodKey) or state.periodKey != periodKey
+        // shift: closed → previousClosed, forming → closed
+        if not na(state.openPrice)
+            state.previousClosedOpen  := state.closedOpen
+            state.previousClosedHigh  := state.closedHigh
+            state.previousClosedLow   := state.closedLow
+            state.previousClosedClose := state.closedClose
+            state.closedOpen  := state.openPrice
+            state.closedHigh  := state.highPrice
+            state.closedLow   := state.lowPrice
+            state.closedClose := state.closePrice
+            state.justClosed  := true
+        // start a fresh forming period
+        state.openPrice  := barOpen
+        state.highPrice  := barHigh
+        state.lowPrice   := barLow
+        state.closePrice := barClose
+        state.periodKey  := periodKey
+        state.startBar   := barIndex
+    else
+        state.highPrice  := math.max(state.highPrice, barHigh)
+        state.lowPrice   := math.min(state.lowPrice,  barLow)
+        state.closePrice := barClose
+    state
+
+// ═══ SMC ENGINE — MSB + BOS + Order Blocks + FVG (from ALPHA, intact) ════════
+// Types live in SHARED UDTS; constants above. This section is the detection
+// helpers (non-exported, state by reference) plus the exported newState()/run() API.
+
+// ── Detection helpers (non-exported; state by reference) ──
+detectLeg(simple int pivotLength) =>
+    var int legDirection = 0
+    bool newLegHigh = high[pivotLength] > ta.highest(pivotLength)
+    bool newLegLow  = low[pivotLength]  < ta.lowest(pivotLength)
+    if newLegHigh
+        legDirection := BEARISH_LEG
+    else if newLegLow
+        legDirection := BULLISH_LEG
+    legDirection
+
+updateStructurePivot(simple int pivotLength, bool isInternal, smcState structureState) =>
+    int legDirection = detectLeg(pivotLength)
+    int legChange    = ta.change(legDirection)
+    if legChange != 0
+        if legChange == 1
+            pivot lowPivot = isInternal ? structureState.internalLow : structureState.swingLow
+            lowPivot.lastLevel    := lowPivot.currentLevel
+            lowPivot.currentLevel := low[pivotLength]
+            lowPivot.crossed      := false
+            lowPivot.barTime      := time[pivotLength]
+            lowPivot.barIndex     := bar_index[pivotLength]
+        else
+            pivot highPivot = isInternal ? structureState.internalHigh : structureState.swingHigh
+            highPivot.lastLevel    := highPivot.currentLevel
+            highPivot.currentLevel := high[pivotLength]
+            highPivot.crossed      := false
+            highPivot.barTime      := time[pivotLength]
+            highPivot.barIndex     := bar_index[pivotLength]
+
+// structure line + label (HISTORICAL keeps each; PRESENT reuses via per-call-site var)
+drawStructureBreak(pivot structurePivot, string breakTag, color breakColor, string labelStyle, string labelSize, bool presentMode) =>
+    var line  structureLine  = na
+    var label structureLabel = na
+    if presentMode
+        line.delete(structureLine)
+        label.delete(structureLabel)
+    structureLine  := line.new(chart.point.new(structurePivot.barTime, na, structurePivot.currentLevel), chart.point.new(time, na, structurePivot.currentLevel), xloc = xloc.bar_time, color = breakColor, style = line.style_dashed)
+    structureLabel := label.new(chart.point.new(na, math.round(0.5 * (structurePivot.barIndex + bar_index)), structurePivot.currentLevel), breakTag, xloc = xloc.bar_index, color = color(na), textcolor = breakColor, style = labelStyle, size = labelSize)
+
+// store an order block at a structure break (mirror of LuxAlgo storeOrderBlock)
+storeOrderBlock(pivot structurePivot, int orderBlockBias, smcState structureState) =>
+    array<float> parsedRange = na
+    int          anchorIndex = na
+    if orderBlockBias == BEARISH
+        parsedRange := structureState.parsedHighs.slice(structurePivot.barIndex, bar_index)
+        anchorIndex := structurePivot.barIndex + parsedRange.indexof(parsedRange.max())
+    else
+        parsedRange := structureState.parsedLows.slice(structurePivot.barIndex, bar_index)
+        anchorIndex := structurePivot.barIndex + parsedRange.indexof(parsedRange.min())
+    orderBlock newOrderBlock = orderBlock.new(structureState.parsedHighs.get(anchorIndex), structureState.parsedLows.get(anchorIndex), structureState.times.get(anchorIndex), orderBlockBias)
+    if structureState.internalOrderBlocks.size() >= 100
+        structureState.internalOrderBlocks.pop()
+    structureState.internalOrderBlocks.unshift(newOrderBlock)
+
+// remove mitigated order blocks
+deleteMitigatedOrderBlocks(smcState structureState, string orderBlockMitigation) =>
+    float bearishMitigationSource = orderBlockMitigation == "Close" ? close : high
+    float bullishMitigationSource = orderBlockMitigation == "Close" ? close : low
+    for [orderBlockIndex, currentOrderBlock] in structureState.internalOrderBlocks
+        bool isMitigated = false
+        if bearishMitigationSource > currentOrderBlock.barHigh and currentOrderBlock.bias == BEARISH
+            isMitigated := true
+        else if bullishMitigationSource < currentOrderBlock.barLow and currentOrderBlock.bias == BULLISH
+            isMitigated := true
+        if isMitigated
+            structureState.internalOrderBlocks.remove(orderBlockIndex)
+
+// draw the active order blocks into the box pool
+drawOrderBlocks(smcState structureState, int maxOrderBlocks, color orderBlockBullColor, color orderBlockBearColor) =>
+    int orderBlockCount = structureState.internalOrderBlocks.size()
+    if orderBlockCount > 0 and structureState.internalOrderBlocksBoxes.size() > 0
+        array<orderBlock> visibleOrderBlocks = structureState.internalOrderBlocks.slice(0, math.min(maxOrderBlocks, orderBlockCount))
+        for [orderBlockIndex, currentOrderBlock] in visibleOrderBlocks
+            if orderBlockIndex < structureState.internalOrderBlocksBoxes.size()
+                color orderBlockColor = currentOrderBlock.bias == BEARISH ? orderBlockBearColor : orderBlockBullColor
+                box orderBlockBox = structureState.internalOrderBlocksBoxes.get(orderBlockIndex)
+                orderBlockBox.set_top_left_point(    chart.point.new(currentOrderBlock.barTime, na, currentOrderBlock.barHigh))
+                orderBlockBox.set_bottom_right_point(chart.point.new(last_bar_time, na, currentOrderBlock.barLow))
+                orderBlockBox.set_border_color(na)
+                orderBlockBox.set_bgcolor(color.new(orderBlockColor, 80))
+
+// remove mitigated fair value gaps
+deleteMitigatedFairValueGaps(smcState structureState) =>
+    for [fairValueGapIndex, currentFairValueGap] in structureState.fairValueGaps
+        if (low < currentFairValueGap.bottom and currentFairValueGap.bias == BULLISH) or (high > currentFairValueGap.top and currentFairValueGap.bias == BEARISH)
+            currentFairValueGap.topBox.delete()
+            currentFairValueGap.bottomBox.delete()
+            structureState.fairValueGaps.remove(fairValueGapIndex)
+
+buildFairValueGapBox(int leftTime, int rightTime, float topPrice, float bottomPrice, color boxColor, int fairValueGapExtend) =>
+    box.new(chart.point.new(leftTime, na, topPrice), chart.point.new(rightTime + fairValueGapExtend * (time - time[1]), na, bottomPrice), xloc = xloc.bar_time, border_color = boxColor, bgcolor = boxColor)
+
+// detect + draw fair value gaps (chart-TF evaluates every bar — the validated fix)
+detectFairValueGaps(smcState structureState, float currentHigh, float currentLow, float previousClose, float twoBarHigh, float twoBarLow, int previousTime, int currentTime, float barDeltaPercent, float threshold, int fairValueGapExtend, color fairValueGapBullColor, color fairValueGapBearColor) =>
+    bool  isBullishGap = currentLow > twoBarHigh and previousClose > twoBarHigh and barDeltaPercent > threshold
+    bool  isBearishGap = currentHigh < twoBarLow and previousClose < twoBarLow and -barDeltaPercent > threshold
+    color bullishGapColor = color.new(fairValueGapBullColor, 70)
+    color bearishGapColor = color.new(fairValueGapBearColor, 70)
+    if isBullishGap
+        structureState.fairValueGaps.unshift(fairValueGap.new(currentLow, twoBarHigh, BULLISH, buildFairValueGapBox(previousTime, currentTime, currentLow, math.avg(currentLow, twoBarHigh), bullishGapColor, fairValueGapExtend), buildFairValueGapBox(previousTime, currentTime, math.avg(currentLow, twoBarHigh), twoBarHigh, bullishGapColor, fairValueGapExtend)))
+    if isBearishGap
+        structureState.fairValueGaps.unshift(fairValueGap.new(currentHigh, twoBarLow, BEARISH, buildFairValueGapBox(previousTime, currentTime, currentHigh, math.avg(currentHigh, twoBarLow), bearishGapColor, fairValueGapExtend), buildFairValueGapBox(previousTime, currentTime, math.avg(currentHigh, twoBarLow), twoBarLow, bearishGapColor, fairValueGapExtend)))
+
+// internal structure break (MSB + BOS) detection + record + OB store
+detectStructureBreaks(smcState structureState, bool showStructure, bool showOrderBlocks, bool useConfluence, color bullColor, color bearColor, string labelSize, bool presentMode, smcResult structureBreakResult) =>
+    var bool bullishConfluenceBar = true
+    var bool bearishConfluenceBar = true
+    if useConfluence
+        bullishConfluenceBar := high - math.max(close, open) > math.min(close, open) - low
+        bearishConfluenceBar := high - math.max(close, open) < math.min(close, open) - low
+
+    bool internalHighValid = structureState.internalHigh.currentLevel != structureState.swingHigh.currentLevel and bullishConfluenceBar
+    if ta.crossover(close, structureState.internalHigh.currentLevel) and not structureState.internalHigh.crossed and internalHighValid
+        bool wasBearishTrend = structureState.internalTrend.bias == BEARISH
+        if wasBearishTrend
+            structureBreakResult.msbBull := true        // reversal (CHoCH): prior internal trend was bearish
+        else
+            structureBreakResult.bosBull := true        // continuation (BOS): prior internal trend bullish/neutral
+        structureState.internalHigh.crossed := true
+        structureState.internalTrend.bias   := BULLISH
+        if showStructure
+            drawStructureBreak(structureState.internalHigh, wasBearishTrend ? "MSB" : "BOS", bullColor, label.style_label_down, labelSize, presentMode)
+        if showOrderBlocks
+            storeOrderBlock(structureState.internalHigh, BULLISH, structureState)
+
+    bool internalLowValid = structureState.internalLow.currentLevel != structureState.swingLow.currentLevel and bearishConfluenceBar
+    if ta.crossunder(close, structureState.internalLow.currentLevel) and not structureState.internalLow.crossed and internalLowValid
+        bool wasBullishTrend = structureState.internalTrend.bias == BULLISH
+        if wasBullishTrend
+            structureBreakResult.msbBear := true        // reversal (CHoCH): prior internal trend was bullish
+        else
+            structureBreakResult.bosBear := true        // continuation (BOS): prior internal trend bearish/neutral
+        structureState.internalLow.crossed := true
+        structureState.internalTrend.bias  := BEARISH
+        if showStructure
+            drawStructureBreak(structureState.internalLow, wasBullishTrend ? "MSB" : "BOS", bearColor, label.style_label_up, labelSize, presentMode)
+        if showOrderBlocks
+            storeOrderBlock(structureState.internalLow, BEARISH, structureState)
+
+// ── Exported API ──
+
+// @function Create an initialised state object. Call once per host: `var st = ammo.newState()`.
+export newState() =>
+    smcState.new(pivot.new(na, na, false), pivot.new(na, na, false), pivot.new(na, na, false), pivot.new(na, na, false), trend.new(0), array.new<float>(), array.new<float>(), array.new<int>(), array.new<orderBlock>(), array.new<box>(), array.new<fairValueGap>())
+
+// @function Run SMC (MSB + BOS + OB + FVG) for one bar.
+// @returns smcResult { bosBull, bosBear, msbBull, msbBear, lastPivotHigh, lastPivotLow, trendBias }
+export run(simple int internalLen = 5, simple int swingLen = 50, bool confluence = false, bool present = false, bool showMSB = true, color bullCol = #089981, color bearCol = #f23645, string lblSize = size.tiny, bool showOB = true, int maxOB = 5, string obFilter = "Atr", string obMitigation = "High/Low", color obBullCol = #3179f5, color obBearCol = #f77c80, bool showFVG = true, bool fvgAutoThresh = false, int fvgExtend = 1, color fvgBullCol = #00ff68, color fvgBearCol = #ff0008, smcState st) =>
+    smcResult structureBreakResult = smcResult.new()
+
+    // first-bar OB box pool
+    if barstate.isfirst and showOB
+        for orderBlockSlot = 1 to maxOB
+            st.internalOrderBlocksBoxes.push(box.new(na, na, na, na, xloc = xloc.bar_time, extend = extend.right))
+
+    // volatility + parsed arrays (OB anchor data)
+    float atrMeasure          = ta.atr(200)
+    float cumulativeRange     = ta.cum(ta.tr) / bar_index
+    float volatilityMeasure   = obFilter == "Atr" ? atrMeasure : cumulativeRange
+    bool  isHighVolatilityBar = (high - low) >= (2 * volatilityMeasure)
+    float parsedHigh          = isHighVolatilityBar ? low : high
+    float parsedLow           = isHighVolatilityBar ? high : low
+    st.parsedHighs.push(parsedHigh)
+    st.parsedLows.push(parsedLow)
+    st.times.push(time)
+
+    // FVG inputs — chart timeframe, computed directly (NO request.security -> no lag)
+    float previousClose = close[1]
+    float previousOpen  = open[1]
+    int   previousTime  = time[1]
+    float currentHigh   = high
+    float currentLow    = low
+    int   currentTime   = time
+    float twoBarHigh    = high[2]
+    float twoBarLow     = low[2]
+    float barDeltaPercent       = (previousClose - previousOpen) / (previousOpen * 100)
+    float cumulativeAbsDelta    = ta.cum(math.abs(barDeltaPercent))
+    float fairValueGapThreshold = fvgAutoThresh ? cumulativeAbsDelta / bar_index * 2 : 0
+
+    // FVG mitigation before new detection
+    if showFVG
+        deleteMitigatedFairValueGaps(st)
+
+    // structure detection — swing first (feeds the internal confluence test), then internal
+    updateStructurePivot(swingLen,    false, st)
+    updateStructurePivot(internalLen, true,  st)
+
+    // internal MSB/BOS + OB store
+    detectStructureBreaks(st, showMSB, showOB, confluence, bullCol, bearCol, lblSize, present, structureBreakResult)
+
+    // OB mitigation, FVG detection
+    if showOB
+        deleteMitigatedOrderBlocks(st, obMitigation)
+    if showFVG
+        detectFairValueGaps(st, currentHigh, currentLow, previousClose, twoBarHigh, twoBarLow, previousTime, currentTime, barDeltaPercent, fairValueGapThreshold, fvgExtend, fvgBullCol, fvgBearCol)
+
+    // OB draw on the last bar (same cadence as LuxAlgo)
+    if showOB and (barstate.islastconfirmedhistory or barstate.islast)
+        drawOrderBlocks(st, maxOB, obBullCol, obBearCol)
+
+    structureBreakResult.lastPivotHigh := st.internalHigh.currentLevel
+    structureBreakResult.lastPivotLow  := st.internalLow.currentLevel
+    structureBreakResult.trendBias     := st.internalTrend.bias
+    structureBreakResult
+
+// ═══ SWING ENGINE — confirmed pivot high/low tracker (LuxAlgo swing detector) ═
+// A dedicated, self-contained swing detector — SEPARATE from the SMC/BOS engine
+// above. Mirrors LuxAlgo "Swing Highs/Lows": ta.pivothigh(length,length) /
+// ta.pivotlow(length,length). A pivot is only CONFIRMED once `length` bars have
+// printed on BOTH sides of it, so the latched swing is always a fully-formed one
+// sitting >= `length` bars back (NO lookahead — safe for live stops). The host
+// creates the state once with newSwingState(), calls advanceSwing() every bar,
+// and reads lastSwingHigh / lastSwingLow (WICK extremes) at signal time.
+//   lastSwingHigh / lastSwingLow      : wick-extreme price of the latest confirmed pivot
+//   lastSwingHighTime / ...LowTime    : bar time of that pivot (for drawing)
+//   lastSwingHighBar  / ...LowBar     : bar_index of that pivot
+//   lastSwingHighLabel/ ...LowLabel   : "HH"/"LH" and "LL"/"HL" vs the prior pivot (LuxAlgo)
+
+// @type Mutable swing-detector state — create once per host with newSwingState().
+export type SwingState
+    float  lastSwingHigh      = na
+    int    lastSwingHighTime  = na
+    int    lastSwingHighBar   = na
+    string lastSwingHighLabel = na
+    float  lastSwingLow       = na
+    int    lastSwingLowTime   = na
+    int    lastSwingLowBar    = na
+    string lastSwingLowLabel  = na
+    bool   newSwingHigh       = false   // true only on the bar a new pivot high confirms
+    bool   newSwingLow        = false   // true only on the bar a new pivot low confirms
+
+// @function Create an initialised swing state. Call once: `var ss = ammo.newSwingState()`.
+export newSwingState() =>
+    SwingState.new()
+
+// @function Advance the swing detector one bar. On a confirmed pivot it latches the
+//           WICK extreme (pivot high = that bar's high; pivot low = that bar's low),
+//           its time/bar, and an HH/LH (or LL/HL) tag vs the previous pivot.
+//           `length` is the LuxAlgo pivot length (left = right = length).
+// @returns  the same state (mutated)
+export advanceSwing(SwingState state, simple int length) =>
+    float pivotHigh = ta.pivothigh(length, length)
+    float pivotLow  = ta.pivotlow(length, length)
+    state.newSwingHigh := false
+    state.newSwingLow  := false
+    if not na(pivotHigh)
+        state.lastSwingHighLabel := na(state.lastSwingHigh) or pivotHigh > state.lastSwingHigh ? "HH" : "LH"
+        state.lastSwingHigh      := pivotHigh
+        state.lastSwingHighTime  := time[length]
+        state.lastSwingHighBar   := bar_index - length
+        state.newSwingHigh       := true
+    if not na(pivotLow)
+        state.lastSwingLowLabel := na(state.lastSwingLow) or pivotLow < state.lastSwingLow ? "LL" : "HL"
+        state.lastSwingLow      := pivotLow
+        state.lastSwingLowTime  := time[length]
+        state.lastSwingLowBar   := bar_index - length
+        state.newSwingLow       := true
+    state
+
+// ═══ TRADE KILLZONES — explicit per-hour, per-quarter activity ═══════════════
+// A killzone is expressed as a list of active CLOCK HOURS, each carrying which of
+// the four quarters (A/M/D/C = quarterIndex 1/2/3/4) are tradeable in that hour.
+// The query consumes the host's OWN hourLocal + quarterIndex (the single time
+// engine, resolveContainerQuarter) — it performs NO time math of its own, so it
+// can never drift from the container/quarter clock the rest of the system uses.
+
+// @type One active killzone hour and which quarters trade within it.
+//   hourOfDay  : clock hour 0–23 in the anchor timezone (matches hourLocal).
+//   quarterA/M/D/C : whether quarterIndex 1/2/3/4 is tradeable this hour.
+export type KillzoneHour
+    int  hourOfDay   = na
+    bool quarterA    = false
+    bool quarterM    = false
+    bool quarterD    = false
+    bool quarterC    = false
+
+// @function Is the killzone open at this hour + quarter?
+//   Pass the host's hourLocal and quarterIndex (from resolveContainerQuarter).
+//   Closed if the hour is not in the list; otherwise the matching quarter's flag.
+// @returns true when trading is permitted at (hourOfDay, quarterIndex)
+export isKillzoneOpen(array<KillzoneHour> activeHours, int hourOfDay, int quarterIndex) =>
+    bool killzoneOpen = false
+    for kzHour in activeHours
+        if kzHour.hourOfDay == hourOfDay
+            killzoneOpen := quarterIndex == 1 ? kzHour.quarterA : quarterIndex == 2 ? kzHour.quarterM : quarterIndex == 3 ? kzHour.quarterD : kzHour.quarterC
+            break
+    killzoneOpen
+
+// @type One active killzone CONTAINER and which of its 90m quarters trade.
+//   containerOfDay : 0-based container slot from the anchor (e.g. 6h tiling → 0–3).
+//   quarterA/M/D/C : whether quarterIndex 1/2/3/4 within that container is tradeable.
+export type KillzoneContainer
+    int  containerOfDay = na
+    bool quarterA       = false
+    bool quarterM       = false
+    bool quarterD       = false
+    bool quarterC       = false
+
+// @function Is the killzone open at this container + quarter?
+//   Pass the host's containerIndex + quarterIndex (from resolveContainerQuarter).
+//   With even day-tiling (e.g. 6h containers) containerIndex is already the 0-based
+//   container-of-day; it is clock-derived upstream, so it never drifts across
+//   weekends/gaps. Closed if the container slot is not listed; otherwise the
+//   matching quarter's flag.
+// @returns true when trading is permitted at (containerIndex, quarterIndex)
+export isKillzoneOpenByContainer(array<KillzoneContainer> activeContainers, int containerIndex, int quarterIndex) =>
+    bool killzoneOpen = false
+    for kzContainer in activeContainers
+        if kzContainer.containerOfDay == containerIndex
+            killzoneOpen := quarterIndex == 1 ? kzContainer.quarterA : quarterIndex == 2 ? kzContainer.quarterM : quarterIndex == 3 ? kzContainer.quarterD : kzContainer.quarterC
+            break
+    killzoneOpen
+
+// @function Session label for a clock hour (display only — not a trading gate).
+//   Boundaries match the legacy windows: Asia 10–15, London 16–20, Overlap 21–22,
+//   New York 23–04 (wraps midnight), Dead 05–09.
+// @returns "ASIA" / "LONDON" / "OVERLAP" / "NEW_YORK" / "DEAD" / "OTHER"
+export sessionName(int hourOfDay) =>
+    hourOfDay >= 10 and hourOfDay <= 15 ? "ASIA" : hourOfDay >= 16 and hourOfDay <= 20 ? "LONDON" : (hourOfDay == 21 or hourOfDay == 22) ? "OVERLAP" : (hourOfDay == 23 or hourOfDay <= 4) ? "NEW_YORK" : (hourOfDay >= 5 and hourOfDay <= 9) ? "DEAD" : "OTHER"
+
+// ═══ TIME MATH — container / quarter / blackout resolvers (anchor passed in) ══
+// Pure time logic. A library can't read host inputs, so the anchor timezone and
+// anchor start-hour are PARAMETERS — the host passes its own input values in.
+
+// @function Container / quarter resolver (bias + visual structure). Sizing is
+//   parameterised: containerMinutes / quarterMinutes default to 60 / 15 (1h / 15m).
+//   Hosts needing other tilings (e.g. CHARLIE's 6h / 90m) pass 360 / 90.
+//   Pick pairs where containerMinutes is divisible by quarterMinutes, or the last
+//   quarter runs ragged.
+// @returns [containerIndex, quarterIndex]
+export resolveContainerQuarter(int barTime, string anchorTimezone, int anchorStartHour, int containerMinutes = 60, int quarterMinutes = 15) =>
+    int hourValue   = hour(barTime, anchorTimezone)
+    int minuteValue = minute(barTime, anchorTimezone)
+    int minutesSinceAnchor   = hourValue >= anchorStartHour ? (hourValue - anchorStartHour) * 60 + minuteValue : (hourValue + (24 - anchorStartHour)) * 60 + minuteValue
+    int containerIndexValue  = math.floor(minutesSinceAnchor / containerMinutes)
+    int minutesIntoContainer = minutesSinceAnchor - containerIndexValue * containerMinutes
+    int quarterIndexValue    = math.floor(minutesIntoContainer / quarterMinutes) + 1
+    [containerIndexValue, quarterIndexValue]
+
+// @function Weekend blackout (no trading from Sat dead-session through Mon anchor).
+// @returns true when the bar falls inside the weekend blackout
+export isWeekendBlackout(int barTime, string anchorTimezone, int anchorStartHour) =>
+    int  dayOfWeekValue = dayofweek(barTime, anchorTimezone)
+    int  hourValue      = hour(barTime, anchorTimezone)
+    int  deadStartHour  = (anchorStartHour + 18) % 24
+    bool blackout       = (dayOfWeekValue == dayofweek.saturday and hourValue >= deadStartHour) or (dayOfWeekValue == dayofweek.sunday) or (dayOfWeekValue == dayofweek.monday and hourValue < anchorStartHour)
+    blackout
+
+// ═══ RISK MATH — stop / target distance helpers (stateless) ══════════════════
+// Pure number-in/number-out. The host passes prices and parameters; the host
+// decides WHICH stop type to use and feeds the chosen value in.
+
+// @function Convert a percent-of-price into a price distance.
+export percentToDistance(float price, float stopPercent) =>
+    float distance = price * stopPercent / 100.0
+    distance
+
+// @function Resolve a complete entry: stop (fixed or structural), target, band-reject, geometry.
+//   else            → structural level, gated by the [min, max] distance band.
+//   A structural stop outside the band, a na structural level, or invalid geometry → valid=false (reject).
+// @returns [stopPrice, targetPrice, valid]
+export resolveEntry(int direction, float entryPrice, float structuralStopLevel, float structuralMinDistance, float structuralMaxDistance, float riskRewardRatio) =>
+    float stopPrice = na
+    bool  rejected  = false
+    if na(structuralStopLevel)
+        rejected := true
+    else
+        stopPrice := structuralStopLevel
+        float structuralDistance = math.abs(entryPrice - stopPrice)
+        rejected := structuralDistance < structuralMinDistance or structuralDistance > structuralMaxDistance
+    float riskDistance = na(stopPrice) ? na : math.abs(entryPrice - stopPrice)
+    float targetPrice  = na(stopPrice) ? na : (direction == 1 ? entryPrice + riskDistance * riskRewardRatio : entryPrice - riskDistance * riskRewardRatio)
+    bool geometryValid = not na(stopPrice) and riskDistance > 0 and (direction == 1 ? (stopPrice < entryPrice and targetPrice > entryPrice) : (stopPrice > entryPrice and targetPrice < entryPrice))
+    [stopPrice, targetPrice, not rejected and geometryValid]
+
+// ═══ BIAS SCORING  ═══════════════
+// @function Score the latest 2 closed records into a spot bias and market state.
+//           Bullish = higher high AND higher low vs previous; Bearish = lower high
+//           AND lower low; everything else (inside bar, outside bar, any equal
+//           extreme, <2 records) falls through to RANGING.
+// @returns [spotBias, marketState]
+// ═══ MOVING AVERAGE — configurable type (SMA·EMA·WMA·RMA·VWMA) ════════════════
+// @function Moving average of `source` over `length`, selected by `maType`.
+//           EMA and RMA are stateful (carry a running value per call site);
+//           SMA / WMA / VWMA are windowed. VWMA reads the chart `volume` series.
+//           Unrecognised maType falls through to SMA.
+// @returns  the moving-average value
+export movingAverage(float source, int length, string maType) =>
+    switch maType
+        "EMA" =>
+            var float emaValue = na
+            float k = 2.0 / (length + 1)
+            emaValue := na(emaValue) ? source : emaValue + k * (source - emaValue)
+            emaValue
+        "WMA" =>
+            float weightedSum = 0.0
+            float weightTotal = 0.0
+            for i = 0 to length - 1
+                float w = length - i
+                weightedSum += nz(source[i]) * w
+                weightTotal += w
+            weightedSum / weightTotal
+        "RMA" =>
+            var float rmaValue = na
+            rmaValue := na(rmaValue) ? source : (rmaValue * (length - 1) + source) / length
+            rmaValue
+        "VWMA" =>
+            float volumeWeightedSum = 0.0
+            float volumeTotal       = 0.0
+            for i = 0 to length - 1
+                float v = nz(volume[i])
+                volumeWeightedSum += nz(source[i]) * v
+                volumeTotal       += v
+            volumeTotal != 0.0 ? volumeWeightedSum / volumeTotal : nz(source)
+        =>
+            float simpleSum = 0.0
+            for i = 0 to length - 1
+                simpleSum += nz(source[i])
+            simpleSum / length
+
+// @function Score two adjacent closed periods (high/low each) into spot bias + market state.
+//           Bullish = higher high AND higher low; Bearish = lower high AND lower low;
+//           inside / outside / equal-extreme → RANGING. Range expand/contract → market state.
+//           Operates directly on two records (no array); pair with PeriodOHLC closed/previousClosed.
+// @returns [spotBias, marketState]
+export evaluateBias(float currentHigh, float currentLow, float previousHigh, float previousLow) =>
+    int spotBias    = BIAS_RANGING
+    int marketState = STATE_NEUTRAL
+    if not na(currentHigh) and not na(previousHigh)
+        bool higherHigh = currentHigh > previousHigh
+        bool higherLow  = currentLow  > previousLow
+        bool lowerHigh  = currentHigh < previousHigh
+        bool lowerLow   = currentLow  < previousLow
+        if higherHigh and higherLow
+            spotBias := BIAS_BULLISH
+        if lowerHigh and lowerLow
+            spotBias := BIAS_BEARISH
+        float currentRange  = currentHigh - currentLow
+        float previousRange = previousHigh - previousLow
+        if currentRange > previousRange
+            marketState := STATE_EXPANSION
+        if currentRange < previousRange
+            marketState := STATE_CONTRACTION
+    [spotBias, marketState]
+
+export evaluateBiasWindow(array<ClosedQuarter> closedQuarters) =>
+    int spotBias    = BIAS_RANGING
+    int marketState = STATE_NEUTRAL
+    int recordCount = array.size(closedQuarters)
+    if recordCount >= 2
+        ClosedQuarter currentRecord  = array.get(closedQuarters, recordCount - 1)
+        ClosedQuarter previousRecord = array.get(closedQuarters, recordCount - 2)
+        if not na(currentRecord) and not na(previousRecord)
+            bool higherHigh = currentRecord.topPrice    > previousRecord.topPrice
+            bool higherLow  = currentRecord.bottomPrice > previousRecord.bottomPrice
+            bool lowerHigh  = currentRecord.topPrice    < previousRecord.topPrice
+            bool lowerLow   = currentRecord.bottomPrice < previousRecord.bottomPrice
+            if higherHigh and higherLow
+                spotBias := BIAS_BULLISH
+            if lowerHigh and lowerLow
+                spotBias := BIAS_BEARISH
+            // inside bar (lowerHigh and higherLow) and outside bar (higherHigh and
+            // lowerLow) both remain RANGING by default — no positive match above.
+            bool rangeExpanding   = currentRecord.priceRange > previousRecord.priceRange
+            bool rangeContracting = currentRecord.priceRange < previousRecord.priceRange
+            if rangeExpanding
+                marketState := STATE_EXPANSION
+            if rangeContracting
+                marketState := STATE_CONTRACTION
+    [spotBias, marketState]
+
+// ═══ TEXT / FORMAT — id -> human-readable text / colour helpers ══════════════
+
+// @function Bias id -> short label ("BULL" / "BEAR" / "RANGE").
+export biasText(int biasId) =>
+    string label = biasId == BIAS_BULLISH ? "BULL" : biasId == BIAS_BEARISH ? "BEAR" : "RANGE"
+    label
+
+// @function Bias id -> colour (themeable via params).
+export biasColor(int biasId, color bullishColor = #00e676, color bearishColor = #f23645, color rangingColor = #9e9e9e) =>
+    color resolvedColor = biasId == BIAS_BULLISH ? bullishColor : biasId == BIAS_BEARISH ? bearishColor : rangingColor
+    resolvedColor
+
+// @function Market-state id -> short label.
+export marketStateText(int stateId) =>
+    string label = stateId == STATE_EXPANSION ? "EXPANSION" : stateId == STATE_CONTRACTION ? "CONTRACTION" : "NEUTRAL"
+    label
+
+// @function Market-state id -> colour (themeable via params).
+export marketStateColor(int stateId, color expansionColor = #00e676, color contractionColor = #ff9800, color neutralColor = #9e9e9e) =>
+    color resolvedColor = stateId == STATE_EXPANSION ? expansionColor : stateId == STATE_CONTRACTION ? contractionColor : neutralColor
+    resolvedColor
+
+// ═══ PAYLOAD / ALERTS — webhook JSON builder ═════════════════════════════════
+// Builds the alert payload string. The HOST fires alert()/log.info(). JSON keys
+// must match the webhook (MT5 bridge) contract on the receiving end.
+
+// @function Build the trade webhook payload (JSON string).
+export payload(string executionTarget, string schemaVersion, string providerName, string strategyId, string strategyName, string signalId, string timestampLocal, string timestampUtc, string chartType, string chartTimeframe, string killzoneName, string brokerSymbol, string side, float entryPrice, float stopPrice, float targetPrice, string comment) =>
+    string payloadJson = '{' +
+         '"execution_target":"' + executionTarget + '",' +
+         '"schema_version":"'   + schemaVersion   + '",' +
+         '"provider":"'         + providerName    + '",' +
+         '"strategy_id":"'      + strategyId      + '",' +
+         '"strategy_name":"'    + strategyName    + '",' +
+         '"signal_id":"'        + signalId        + '",' +
+         '"timestamp_mel":"'    + timestampLocal  + '",' +
+         '"timestamp_utc":"'    + timestampUtc    + '",' +
+         '"chart_type":"'       + chartType       + '",' +
+         '"chart_timeframe":"'  + chartTimeframe  + '",' +
+         '"session":"'          + killzoneName    + '",' +
+         '"symbol":"'           + brokerSymbol    + '",' +
+         '"signal_direction":"' + side            + '",' +
+         '"signal_price":'      + str.tostring(entryPrice)  + ',' +
+         '"stop_loss":'         + str.tostring(stopPrice)   + ',' +
+         '"take_profit":'       + str.tostring(targetPrice) + ',' +
+         '"comment":"'          + comment         + '"' +
+         '}'
+    payloadJson
